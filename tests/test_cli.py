@@ -208,17 +208,109 @@ def test_format_job_label_shows_scheduled_tag(cli_module):
     queued_label = cli_module.format_job_label(job)
     sched_label = cli_module.format_job_label(job_sched)
 
-    assert "(S)" in sched_label  # display=scheduled -> (S)
+    # New format shows full display state word, not single-letter abbreviation
+    assert "scheduled" in sched_label
+    assert "(S)" not in sched_label
     assert "(S)" not in queued_label
-    assert "[claude]" in sched_label
-    assert "[session=sess-1]" in sched_label
+    assert "claude" in sched_label
+    assert "resume" in sched_label
 
 
 def test_format_job_label_session_new(cli_module):
     from schedule_agent.transitions import make_job
     job = make_job("job1", "codex", "new", None, "/tmp/p.md", "now", "/tmp", "/tmp/log.txt")
     label = cli_module.format_job_label(job)
-    assert "[session=new]" in label
+    assert "new" in label
+
+
+# ---------------------------------------------------------------------------
+# _format_job_row
+# ---------------------------------------------------------------------------
+
+def test_format_job_row_normal(cli_module):
+    from schedule_agent.transitions import make_job, on_submit
+    job = on_submit(
+        make_job("job1", "claude", "resume", "sess-1", "/tmp/p.md", "03:00 tomorrow", "/tmp", "/tmp/log.txt"),
+        "99",
+    )
+    row = cli_module._format_job_row(job, id_width=4)
+    # All four columns present
+    assert "job1" in row
+    assert "scheduled" in row
+    assert "claude" in row
+    assert "resume" in row
+    # No invalid marker for valid job
+    assert "[!]" not in row
+
+
+def test_format_job_row_session_new(cli_module):
+    from schedule_agent.transitions import make_job
+    job = make_job("job2", "codex", "new", None, "/tmp/p.md", "now", "/tmp", "/tmp/log.txt")
+    row = cli_module._format_job_row(job, id_width=4)
+    assert "new" in row
+    assert "codex" in row
+
+
+def test_format_job_row_session_resume(cli_module):
+    from schedule_agent.transitions import make_job
+    job = make_job("job1", "claude", "resume", "sess-1", "/tmp/p.md", "now", "/tmp", "/tmp/log.txt")
+    row = cli_module._format_job_row(job, id_width=4)
+    assert "resume" in row
+
+
+def test_format_job_row_with_depends_on(cli_module):
+    from schedule_agent.transitions import make_job
+    job = make_job("job2", "codex", "new", None, "/tmp/p.md", "now", "/tmp", "/tmp/log.txt",
+                   depends_on="job1")
+    row = cli_module._format_job_row(job, id_width=4)
+    assert "depends: job1" in row
+
+
+def test_format_job_row_depends_on_truncated(cli_module):
+    from schedule_agent.transitions import make_job
+    long_dep = "a" * 50
+    job = make_job("job2", "codex", "new", None, "/tmp/p.md", "now", "/tmp", "/tmp/log.txt",
+                   depends_on=long_dep)
+    row = cli_module._format_job_row(job, id_width=4)
+    # dep_id truncated to 40 chars with ellipsis
+    assert "depends: " + "a" * 40 + "…" in row
+    assert long_dep not in row
+
+
+def test_format_job_row_missing_prompt_file(cli_module):
+    from schedule_agent.transitions import make_job
+    job = make_job("job1", "claude", "new", None, "/nonexistent/path/p.md", "now", "/tmp", "/tmp/log.txt")
+    row = cli_module._format_job_row(job, id_width=4)
+    assert "[prompt missing]" in row
+
+
+def test_format_job_row_existing_prompt_file(cli_module, tmp_path):
+    from schedule_agent.transitions import make_job
+    pf = tmp_path / "p.md"
+    pf.write_text("hello")
+    job = make_job("job1", "claude", "new", None, str(pf), "now", "/tmp", "/tmp/log.txt")
+    row = cli_module._format_job_row(job, id_width=4)
+    assert "[prompt missing]" not in row
+
+
+def test_format_job_row_invalid_job(cli_module):
+    invalid_job = {"id": "broken-job", "_invalid": True}
+    row = cli_module._format_job_row(invalid_job, id_width=4)
+    assert "broken-job" in row
+    assert "[!]" in row
+    # Should not have normal columns
+    assert "scheduled" not in row
+
+
+def test_format_job_row_id_width_applied(cli_module):
+    from schedule_agent.transitions import make_job, on_submit
+    job = on_submit(
+        make_job("j1", "claude", "new", None, "/tmp/p.md", "now", "/tmp", "/tmp/log.txt"),
+        "1",
+    )
+    row = cli_module._format_job_row(job, id_width=20)
+    # id column should be padded to width 20
+    assert row.startswith("j1" + " " * 18)
 
 
 # ---------------------------------------------------------------------------
@@ -239,8 +331,25 @@ def test_list_jobs_noninteractive_outputs_all_jobs(cli_module):
     output = cli_module.list_jobs_noninteractive()
     assert "job1" in output
     assert "job2" in output
-    assert "[codex]" in output
-    assert "[claude]" in output
+    assert "codex" in output
+    assert "claude" in output
+
+
+def test_list_jobs_noninteractive_id_width_matches_longest(cli_module):
+    from schedule_agent.transitions import make_job
+    jobs = [
+        make_job("short", "codex", "new", None, "/tmp/p1.md", "now", "/tmp", "/tmp/log1.txt"),
+        make_job("a-much-longer-job-id", "claude", "new", None, "/tmp/p2.md", "now", "/tmp", "/tmp/log2.txt"),
+    ]
+    cli_module.save_jobs(jobs)
+    output = cli_module.list_jobs_noninteractive()
+    lines = output.splitlines()
+    assert len(lines) == 2
+    # Both lines' id columns should be padded to longest id length (20)
+    longest = len("a-much-longer-job-id")
+    for line in lines:
+        # The id portion at the start should be at least longest chars before a space
+        assert line[:longest].rstrip() in ("short", "a-much-longer-job-id")
 
 
 # ---------------------------------------------------------------------------

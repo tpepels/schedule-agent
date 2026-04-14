@@ -492,22 +492,60 @@ def create_job() -> dict:
 # ---------------------------------------------------------------------------
 
 def format_job_label(job: dict, state: dict | None = None) -> str:
-    """Format a one-line label for the job list UI.
+    """Format a one-line label for the job list UI (interactive TUI).
 
     ``state`` is the legacy state dict (keyed by job_id); it is used only
     when the job itself has not yet been migrated to the new model.
+
+    Returns a simple readable format: ``job1 (scheduled)  [claude] [resume]``
     """
     display = derive_display_state(job)
-    display_tag = f" ({display.upper()[:1]})" if display != "queued" else ""
-    session_id = job.get("session_id") or job.get("session") or "new"
-    return f"{job['id']}{display_tag}  [{job['when']}]  [{job['agent']}]  [session={session_id}]"
+    display_tag = f" ({display})" if display != "queued" else ""
+    session_mode = job.get("session_mode") or ("resume" if job.get("session_id") else "new")
+    return f"{job['id']}{display_tag}  [{job['agent']}] [{session_mode}]"
+
+
+def _format_job_row(job: dict, id_width: int) -> str:
+    """Format a single job as a columnar row for non-interactive list output.
+
+    Columns: <id>  <display_state>  <agent>  <session>  [depends: <dep>]  [prompt missing]
+
+    Invalid sentinel jobs (``_invalid=True``) are shown as ``<id>  [!]`` only.
+    """
+    job_id = job.get("id", "")
+    if job.get("_invalid"):
+        return f"{job_id}  [!]"
+
+    display = derive_display_state(job)
+    agent = job.get("agent", "")
+    session_mode = job.get("session_mode", "new")
+
+    row = (
+        f"{job_id.ljust(id_width)} "
+        f"{display.ljust(10)} "
+        f"{agent.ljust(8)} "
+        f"{session_mode.ljust(7)}"
+    )
+
+    dep = job.get("depends_on")
+    if dep:
+        if len(dep) > 40:
+            dep = dep[:40] + "…"
+        row += f" depends: {dep}"
+
+    prompt_file = job.get("prompt_file", "")
+    if prompt_file and not Path(prompt_file).exists():
+        row += " [prompt missing]"
+
+    return row
 
 
 def list_jobs_noninteractive() -> str:
     jobs = load_jobs()
     if not jobs:
         return "No jobs."
-    return "\n".join(format_job_label(job) for job in jobs)
+    id_width = max(len(j.get("id", "")) for j in jobs)
+    return "\n".join(_format_job_row(job, id_width) for job in jobs)
 
 
 def list_jobs() -> None:
