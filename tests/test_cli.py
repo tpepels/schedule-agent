@@ -499,3 +499,126 @@ def test_cli_notify_dependency_failure(cli_module):
     loaded = cli_module.load_jobs()
     j = next(x for x in loaded if x["id"] == "child")
     assert j["readiness"] == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# show_job_text
+# ---------------------------------------------------------------------------
+
+def test_show_job_text_contains_all_new_fields(cli_module, tmp_path):
+    from schedule_agent.transitions import make_job
+    prompt = tmp_path / "p.md"
+    prompt.write_text("hello")
+    job = make_job("job1", "claude", "new", None, str(prompt), "03:00 tomorrow", "/tmp", "/tmp/log.txt")
+    text = cli_module.show_job_text(job)
+    assert "id:" in text
+    assert "display:" in text
+    assert "submission:" in text
+    assert "execution:" in text
+    assert "readiness:" in text
+    assert "session:" in text
+    assert "agent:" in text
+    assert "when:" in text
+    assert "at_job_id:" in text
+    assert "depends_on:" in text
+    assert "session_id:" in text
+    assert "cwd:" in text
+    assert "log:" in text
+    assert "prompt_file:" in text
+    assert "prompt_exists:" in text
+    assert "created_at:" in text
+    assert "updated_at:" in text
+    assert "last_run_at:" in text
+
+
+def test_show_job_text_at_job_id_shows_dash_when_none(cli_module, tmp_path):
+    from schedule_agent.transitions import make_job
+    prompt = tmp_path / "p.md"
+    prompt.write_text("hello")
+    job = make_job("job1", "claude", "new", None, str(prompt), "now", "/tmp", "/tmp/log.txt")
+    assert job["at_job_id"] is None
+    text = cli_module.show_job_text(job)
+    assert "at_job_id:     -" in text
+
+
+def test_show_job_text_depends_on_shows_dash_when_absent(cli_module, tmp_path):
+    from schedule_agent.transitions import make_job
+    prompt = tmp_path / "p.md"
+    prompt.write_text("hello")
+    job = make_job("job1", "claude", "new", None, str(prompt), "now", "/tmp", "/tmp/log.txt")
+    assert "depends_on" not in job
+    text = cli_module.show_job_text(job)
+    assert "depends_on:    -" in text
+
+
+def test_show_job_text_session_id_shows_dash_for_new_mode(cli_module, tmp_path):
+    from schedule_agent.transitions import make_job
+    prompt = tmp_path / "p.md"
+    prompt.write_text("hello")
+    job = make_job("job1", "claude", "new", None, str(prompt), "now", "/tmp", "/tmp/log.txt")
+    assert job["session_mode"] == "new"
+    text = cli_module.show_job_text(job)
+    assert "session_id:    -" in text
+
+
+def test_show_job_text_session_id_truncated_to_40_chars(cli_module, tmp_path):
+    from schedule_agent.transitions import make_job
+    prompt = tmp_path / "p.md"
+    prompt.write_text("hello")
+    long_id = "a" * 60
+    job = make_job("job1", "claude", "resume", long_id, str(prompt), "now", "/tmp", "/tmp/log.txt")
+    text = cli_module.show_job_text(job)
+    assert "a" * 40 in text
+    assert "a" * 41 not in text
+
+
+def test_show_job_text_prompt_exists_yes_when_file_exists(cli_module, tmp_path):
+    from schedule_agent.transitions import make_job
+    prompt = tmp_path / "p.md"
+    prompt.write_text("hello")
+    job = make_job("job1", "claude", "new", None, str(prompt), "now", "/tmp", "/tmp/log.txt")
+    text = cli_module.show_job_text(job)
+    assert "prompt_exists: yes" in text
+
+
+def test_show_job_text_prompt_exists_no_when_file_missing(cli_module, tmp_path):
+    from schedule_agent.transitions import make_job
+    prompt = tmp_path / "missing.md"
+    job = make_job("job1", "claude", "new", None, str(prompt), "now", "/tmp", "/tmp/log.txt")
+    text = cli_module.show_job_text(job)
+    assert "prompt_exists: no (file not found)" in text
+
+
+def test_show_job_text_display_line_and_indented_dimensions(cli_module, tmp_path):
+    from schedule_agent.transitions import make_job
+    from schedule_agent.state_model import derive_display_state
+    prompt = tmp_path / "p.md"
+    prompt.write_text("hello")
+    job = make_job("job1", "claude", "new", None, str(prompt), "now", "/tmp", "/tmp/log.txt")
+    expected_display = derive_display_state(job)
+    text = cli_module.show_job_text(job)
+    assert f"display:       {expected_display}" in text
+    assert "  submission:" in text
+    assert "  execution:" in text
+    assert "  readiness:" in text
+    assert "  session:" in text
+
+
+def test_show_job_text_depends_on_shows_condition_when_set(cli_module, tmp_path):
+    from schedule_agent.transitions import make_job
+    prompt = tmp_path / "p.md"
+    prompt.write_text("hello")
+    job = make_job("job1", "claude", "new", None, str(prompt), "now", "/tmp", "/tmp/log.txt",
+                   depends_on="job0", dependency_condition="success")
+    text = cli_module.show_job_text(job)
+    assert "job0 (condition: success)" in text
+
+
+def test_show_job_text_last_run_at_shows_dash_when_none(cli_module, tmp_path):
+    from schedule_agent.transitions import make_job
+    prompt = tmp_path / "p.md"
+    prompt.write_text("hello")
+    job = make_job("job1", "claude", "new", None, str(prompt), "now", "/tmp", "/tmp/log.txt")
+    assert job["last_run_at"] is None
+    text = cli_module.show_job_text(job)
+    assert "last_run_at:   -" in text

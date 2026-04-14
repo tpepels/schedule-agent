@@ -243,15 +243,16 @@ def test_cancel_at_job_failure_records_error_and_drops_at_job_id(cli_module, mon
 # discover_sessions
 # ---------------------------------------------------------------------------
 
-def test_discover_sessions_returns_most_recent_ten_sorted_by_mtime_desc(cli_module, tmp_path, monkeypatch):
+def test_discover_sessions_codex_recurses_date_subdirs_and_returns_ten_newest(cli_module, tmp_path, monkeypatch):
     fake_home = tmp_path / "home"
-    sessions_root = fake_home / ".codex" / "sessions"
-    sessions_root.mkdir(parents=True)
     monkeypatch.setattr(cli_module.Path, "home", lambda: fake_home)
 
+    # Create sessions in date-based subdirectory structure
     created = []
     for i in range(12):
-        p = sessions_root / f"session-{i}.jsonl"
+        date_dir = fake_home / ".codex" / "sessions" / "2026" / "01" / f"{(i % 28) + 1:02d}"
+        date_dir.mkdir(parents=True, exist_ok=True)
+        p = date_dir / f"session-{i}.jsonl"
         p.write_text(f"session {i}", encoding="utf-8")
         created.append(p)
 
@@ -261,8 +262,25 @@ def test_discover_sessions_returns_most_recent_ten_sorted_by_mtime_desc(cli_modu
 
     discovered = cli_module.discover_sessions("codex")
     assert len(discovered) == 10
-    assert discovered[0].name == "session-11.jsonl"
-    assert discovered[-1].name == "session-2.jsonl"
+    assert all(hasattr(s, "id") and hasattr(s, "path") for s in discovered)
+    assert discovered[0].path.name == "session-11.jsonl"
+    assert discovered[-1].path.name == "session-2.jsonl"
+    assert all(s.agent == "codex" for s in discovered)
+
+
+def test_discover_sessions_codex_only_includes_jsonl_files(cli_module, tmp_path, monkeypatch):
+    fake_home = tmp_path / "home"
+    monkeypatch.setattr(cli_module.Path, "home", lambda: fake_home)
+
+    session_dir = fake_home / ".codex" / "sessions" / "2026" / "01" / "01"
+    session_dir.mkdir(parents=True)
+    (session_dir / "session-a.jsonl").write_text("{}", encoding="utf-8")
+    (session_dir / "metadata.json").write_text("{}", encoding="utf-8")
+    (session_dir / "notes.txt").write_text("notes", encoding="utf-8")
+
+    discovered = cli_module.discover_sessions("codex")
+    assert len(discovered) == 1
+    assert discovered[0].path.name == "session-a.jsonl"
 
 
 def test_discover_sessions_returns_empty_when_root_missing(cli_module, tmp_path, monkeypatch):
@@ -273,13 +291,248 @@ def test_discover_sessions_returns_empty_when_root_missing(cli_module, tmp_path,
     assert cli_module.discover_sessions("claude") == []
 
 
+def test_discover_sessions_claude_prefers_current_project(cli_module, tmp_path, monkeypatch):
+    fake_home = tmp_path / "home"
+    monkeypatch.setattr(cli_module.Path, "home", lambda: fake_home)
+
+    cwd = Path("/home/tom/Projects/myproject")
+    project_dir_name = cwd.as_posix().replace("/", "-")
+
+    # Create sessions for the current project
+    current_proj = fake_home / ".claude" / "projects" / project_dir_name
+    current_proj.mkdir(parents=True)
+    for i in range(3):
+        p = current_proj / f"session-current-{i}.jsonl"
+        p.write_text("{}", encoding="utf-8")
+        __import__("os").utime(p, (1_700_000_000 - i, 1_700_000_000 - i))
+
+    # Create sessions for another project with newer mtimes
+    other_proj = fake_home / ".claude" / "projects" / "-home-tom-Projects-other"
+    other_proj.mkdir(parents=True)
+    for i in range(3):
+        p = other_proj / f"session-other-{i}.jsonl"
+        p.write_text("{}", encoding="utf-8")
+        __import__("os").utime(p, (1_800_000_000 + i, 1_800_000_000 + i))
+
+    discovered = cli_module.discover_sessions("claude", cwd=cwd)
+    # Current project sessions must come first despite older mtimes
+    ids = [s.id for s in discovered]
+    current_ids = [s for s in ids if "current" in s]
+    other_ids = [s for s in ids if "other" in s]
+    assert len(current_ids) == 3
+    assert ids.index(current_ids[0]) < ids.index(other_ids[0])
+
+
+def test_discover_sessions_claude_excludes_subagent_files(cli_module, tmp_path, monkeypatch):
+    fake_home = tmp_path / "home"
+    monkeypatch.setattr(cli_module.Path, "home", lambda: fake_home)
+
+    cwd = Path("/home/tom/Projects/myproject")
+    project_dir_name = cwd.as_posix().replace("/", "-")
+    project_dir = fake_home / ".claude" / "projects" / project_dir_name
+    project_dir.mkdir(parents=True)
+
+    # Top-level session
+    (project_dir / "abc123.jsonl").write_text("{}", encoding="utf-8")
+    # Subagent file that should be excluded
+    subagent_dir = project_dir / "abc123" / "subagents"
+    subagent_dir.mkdir(parents=True)
+    (subagent_dir / "agent-xyz.jsonl").write_text("{}", encoding="utf-8")
+
+    discovered = cli_module.discover_sessions("claude", cwd=cwd)
+    assert len(discovered) == 1
+    assert discovered[0].id == "abc123"
+
+
+# ---------------------------------------------------------------------------
+# extract_session_title
+# ---------------------------------------------------------------------------
+
+def test_extract_session_title_claude_returns_ai_title(cli_module, tmp_path):
+    f = tmp_path / "session.jsonl"
+    f.write_text(
+        '{"type": "user", "content": "hello"}\n'
+        '{"type": "ai-title", "aiTitle": "My Session Title"}\n',
+        encoding="utf-8",
+    )
+    assert cli_module.extract_session_title(str(f), "claude") == "My Session Title"
+
+
+def test_extract_session_title_claude_returns_none_when_no_ai_title(cli_module, tmp_path):
+    f = tmp_path / "session.jsonl"
+    f.write_text('{"type": "user", "content": "hello"}\n', encoding="utf-8")
+    assert cli_module.extract_session_title(str(f), "claude") is None
+
+
+def test_extract_session_title_claude_ignores_user_content(cli_module, tmp_path):
+    f = tmp_path / "session.jsonl"
+    # Has user content but no ai-title
+    f.write_text(
+        '{"type": "user", "content": "please do not use this as a title"}\n',
+        encoding="utf-8",
+    )
+    assert cli_module.extract_session_title(str(f), "claude") is None
+
+
+def test_extract_session_title_codex_returns_first_user_message(cli_module, tmp_path):
+    import json as _json
+    f = tmp_path / "session.jsonl"
+    lines = [
+        _json.dumps({"type": "session_meta", "payload": {"type": "init"}}),
+        _json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "Build me a feature\nWith more details"}}),
+    ]
+    f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert cli_module.extract_session_title(str(f), "codex") == "Build me a feature"
+
+
+def test_extract_session_title_codex_returns_none_when_no_user_message(cli_module, tmp_path):
+    import json as _json
+    f = tmp_path / "session.jsonl"
+    lines = [
+        _json.dumps({"type": "session_meta", "payload": {"type": "init"}}),
+        _json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": "Hi"}}),
+    ]
+    f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert cli_module.extract_session_title(str(f), "codex") is None
+
+
+def test_extract_session_title_returns_none_for_missing_file(cli_module):
+    assert cli_module.extract_session_title("/nonexistent/path.jsonl", "claude") is None
+    assert cli_module.extract_session_title("/nonexistent/path.jsonl", "codex") is None
+
+
+def test_extract_session_title_returns_none_for_unknown_agent(cli_module, tmp_path):
+    f = tmp_path / "session.jsonl"
+    f.write_text('{"type": "ai-title", "aiTitle": "Title"}\n', encoding="utf-8")
+    assert cli_module.extract_session_title(str(f), "unknown") is None
+
+
+# ---------------------------------------------------------------------------
+# choose_session
+# ---------------------------------------------------------------------------
+
+def test_choose_session_shows_no_title_label_when_title_missing(cli_module, tmp_path, monkeypatch):
+    fake_home = tmp_path / "home"
+    monkeypatch.setattr(cli_module.Path, "home", lambda: fake_home)
+
+    session_dir = fake_home / ".codex" / "sessions" / "2026" / "01" / "01"
+    session_dir.mkdir(parents=True)
+    p = session_dir / "abcdef12-1234-1234-1234-abcdef123456.jsonl"
+    p.write_text("{}", encoding="utf-8")  # no title content
+
+    labels_seen = []
+
+    def fake_choose(msg, choices, default=None):
+        if msg == "Session":
+            labels_seen.extend(choices)
+        return "New session"
+
+    monkeypatch.setattr(cli_module, "choose", fake_choose)
+    cli_module.choose_session("codex")
+
+    assert any("[no title]" in label for label in labels_seen)
+    assert any("abcdef12" in label for label in labels_seen)
+
+
+def test_choose_session_shows_title_when_present(cli_module, tmp_path, monkeypatch):
+    import json as _json
+    fake_home = tmp_path / "home"
+    monkeypatch.setattr(cli_module.Path, "home", lambda: fake_home)
+
+    session_dir = fake_home / ".codex" / "sessions" / "2026" / "01" / "01"
+    session_dir.mkdir(parents=True)
+    p = session_dir / "abcdef12-1234-1234-1234-abcdef123456.jsonl"
+    p.write_text(
+        _json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "Fix the login bug"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    labels_seen = []
+
+    def fake_choose(msg, choices, default=None):
+        if msg == "Session":
+            labels_seen.extend(choices)
+        return "New session"
+
+    monkeypatch.setattr(cli_module, "choose", fake_choose)
+    cli_module.choose_session("codex")
+
+    assert any("Fix the login bug" in label for label in labels_seen)
+
+
+# ---------------------------------------------------------------------------
+# external JSON format validation
+# ---------------------------------------------------------------------------
+
+def test_real_codex_session_format_matches_expected_layout(cli_module):
+    import json as _json
+    codex_root = Path.home() / ".codex" / "sessions"
+    if not codex_root.exists():
+        import pytest
+        pytest.skip("No codex sessions directory found")
+
+    files = list(codex_root.rglob("*.jsonl"))
+    if not files:
+        import pytest
+        pytest.skip("No codex session files found")
+
+    # Check at most 5 recent files
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in files[:5]:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = _json.loads(line)
+                assert "type" in obj, f"Missing 'type' key in {path}"
+                # Verify event_msg user_message structure
+                if obj.get("type") == "event_msg":
+                    assert "payload" in obj, f"event_msg missing 'payload' in {path}"
+                    payload = obj["payload"]
+                    assert "type" in payload, f"event_msg payload missing 'type' in {path}"
+                    if payload.get("type") == "user_message":
+                        assert "message" in payload, f"user_message payload missing 'message' in {path}"
+                break  # Only check first valid line per file
+
+
+def test_real_claude_session_format_matches_expected_layout(cli_module):
+    import json as _json
+    claude_root = Path.home() / ".claude" / "projects"
+    if not claude_root.exists():
+        import pytest
+        pytest.skip("No claude projects directory found")
+
+    files = []
+    for proj in claude_root.iterdir():
+        if proj.is_dir():
+            files.extend(proj.glob("*.jsonl"))
+
+    if not files:
+        import pytest
+        pytest.skip("No claude session files found")
+
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in files[:5]:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = _json.loads(line)
+                assert "type" in obj, f"Missing 'type' key in {path}"
+                if obj.get("type") == "ai-title":
+                    assert "aiTitle" in obj, f"ai-title record missing 'aiTitle' in {path}"
+                break  # Only check first valid line per file
+
+
 # ---------------------------------------------------------------------------
 # create_job
 # ---------------------------------------------------------------------------
 
 def test_create_job_writes_prompt_file_and_uses_interaction_results(cli_module, monkeypatch, tmp_path):
     monkeypatch.setattr(cli_module, "choose", lambda msg, choices, default=None: "Codex" if msg == "Agent" else choices[0])
-    monkeypatch.setattr(cli_module, "choose_session", lambda agent: "sess-123")
+    monkeypatch.setattr(cli_module, "choose_session", lambda agent, cwd=None: "sess-123")
     monkeypatch.setattr(cli_module, "read_prompt", lambda: "hello prompt")
     monkeypatch.setattr(cli_module, "resolve_time", lambda: "now + 15 minutes")
     monkeypatch.setattr(cli_module, "info", lambda msg: None)
@@ -449,8 +702,8 @@ def test_cli_show_job_prints_details_and_returns_zero(cli_module, capsys):
     rc = cli_module.cli_show_job("job1")
     assert rc == 0
     out = capsys.readouterr().out
-    assert "id:         job1" in out
-    assert f"promptfile: {prompt_path}" in out
+    assert "id:            job1" in out
+    assert f"prompt_file:   {prompt_path}" in out
 
 
 def test_cli_show_job_returns_one_for_missing_job(cli_module, capsys):

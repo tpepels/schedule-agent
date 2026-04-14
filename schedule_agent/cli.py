@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -197,24 +199,149 @@ def clear_state(job_id: str) -> None:
 # Session discovery
 # ---------------------------------------------------------------------------
 
-def discover_sessions(agent: str) -> list[Path]:
-    root = Path.home() / (".codex/sessions" if agent == "codex" else ".claude/projects")
+@dataclass
+class SessionInfo:
+    id: str
+    path: Path
+    agent: str
+    project: str | None
+    title: str | None
+    modified_at: float
+
+
+def extract_session_title(path: str, agent: str) -> str | None:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception:
+        return None
+
+    def iter_json():
+        for line in lines:
+            try:
+                yield json.loads(line)
+            except Exception:
+                continue
+
+    agent = agent.lower().strip()
+
+    if agent == "claude":
+        for obj in iter_json():
+            if obj.get("type") == "ai-title":
+                title = obj.get("aiTitle")
+                if isinstance(title, str):
+                    title = title.strip()
+                    if title:
+                        return title
+        return None
+
+    if agent == "codex":
+        for obj in iter_json():
+            if obj.get("type") == "event_msg":
+                payload = obj.get("payload", {})
+                if payload.get("type") == "user_message":
+                    message = payload.get("message")
+                    if isinstance(message, str):
+                        message = message.strip()
+                        if message:
+                            return message.splitlines()[0]
+        return None
+
+    return None
+
+
+def _discover_codex_sessions(limit: int) -> list[SessionInfo]:
+    root = Path.home() / ".codex" / "sessions"
     if not root.exists():
         return []
-    files = [p for p in root.rglob("*") if p.is_file()]
+    files = [p for p in root.rglob("*.jsonl") if p.is_file()]
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return files[:10]
+    files = files[:limit]
+    result = []
+    for p in files:
+        result.append(SessionInfo(
+            id=p.stem,
+            path=p,
+            agent="codex",
+            project=None,
+            title=extract_session_title(str(p), "codex"),
+            modified_at=p.stat().st_mtime,
+        ))
+    return result
 
 
-def choose_session(agent: str) -> str | None:
-    sessions = discover_sessions(agent)
+def _discover_claude_sessions(cwd: Path | None, limit: int) -> list[SessionInfo]:
+    root = Path.home() / ".claude" / "projects"
+    if not root.exists():
+        return []
+
+    def get_project_sessions(project_dir: Path) -> list[tuple[Path, str]]:
+        return [
+            (p, project_dir.name)
+            for p in project_dir.glob("*.jsonl")
+            if p.is_file()
+        ]
+
+    preferred_project_name: str | None = None
+    preferred: list[tuple[Path, str]] = []
+    other: list[tuple[Path, str]] = []
+
+    if cwd is not None:
+        preferred_project_name = cwd.as_posix().replace("/", "-")
+        preferred_dir = root / preferred_project_name
+        if preferred_dir.exists():
+            preferred = get_project_sessions(preferred_dir)
+            preferred.sort(key=lambda t: t[0].stat().st_mtime, reverse=True)
+
+    for project_dir in root.iterdir():
+        if not project_dir.is_dir():
+            continue
+        if preferred_project_name is not None and project_dir.name == preferred_project_name:
+            continue
+        other.extend(get_project_sessions(project_dir))
+
+    other.sort(key=lambda t: t[0].stat().st_mtime, reverse=True)
+
+    combined = (preferred + other)[:limit]
+
+    result = []
+    for p, project_name in combined:
+        result.append(SessionInfo(
+            id=p.stem,
+            path=p,
+            agent="claude",
+            project=project_name,
+            title=extract_session_title(str(p), "claude"),
+            modified_at=p.stat().st_mtime,
+        ))
+    return result
+
+
+def discover_sessions(agent: str, cwd: Path | None = None, limit: int = 10) -> list[SessionInfo]:
+    if agent == "codex":
+        return _discover_codex_sessions(limit)
+    return _discover_claude_sessions(cwd, limit)
+
+
+def choose_session(agent: str, cwd: Path | None = None) -> str | None:
+    sessions = discover_sessions(agent, cwd=cwd)
     if not sessions:
         return None
-    labels = ["New session"] + [p.stem for p in sessions]
+
+    labels = ["New session"] + [
+        f"{(s.title or '[no title]')} [{s.id[:8]}]"
+        for s in sessions
+    ]
+
     selected = choose("Session", labels, default="New session")
     if selected == "New session":
         return None
-    return selected
+
+    for session, label in zip(sessions, labels[1:]):
+        if label == selected:
+            return session.id
+
+    return None
 
 
 def choose_offset() -> str:
@@ -341,7 +468,7 @@ def schedule(job: dict, dry_run: bool = False) -> str:
 def create_job() -> dict:
     agent_label = choose("Agent", [cfg["label"] for cfg in AGENTS.values()], default="Codex")
     agent = "codex" if agent_label == "Codex" else "claude"
-    session_id = choose_session(agent)
+    session_id = choose_session(agent, cwd=Path.cwd())
     session_mode = "resume" if session_id else "new"
     info("A temporary file will open in your configured editor. Save and close it to continue. Leave it empty to cancel.")
     prompt = read_prompt()
@@ -575,16 +702,59 @@ def choose_job_action_from_list() -> tuple[str | None, dict | None]:
 
 
 def show_job_text(job: dict) -> str:
-    session_id = job.get("session_id") or job.get("session") or "new"
-    return (
-        f"id:         {job['id']}\n"
-        f"agent:      {job['agent']}\n"
-        f"when:       {job['when']}\n"
-        f"session:    {session_id}\n"
-        f"cwd:        {job['cwd']}\n"
-        f"log:        {job['log']}\n"
-        f"promptfile: {job['prompt_file']}"
-    )
+    display = derive_display_state(job)
+
+    # at_job_id
+    at_job_id_val = job.get("at_job_id") or "-"
+
+    # depends_on
+    if job.get("depends_on"):
+        cond = job.get("dependency_condition", "success")
+        depends_on_val = f"{job['depends_on']} (condition: {cond})"
+    else:
+        depends_on_val = "-"
+
+    # session_id
+    if job.get("session_mode") == "new":
+        session_id_val = "-"
+    else:
+        raw = job.get("session_id") or "-"
+        session_id_val = raw[:40]
+
+    # prompt_exists
+    if Path(job["prompt_file"]).exists():
+        prompt_exists_val = "yes"
+    else:
+        prompt_exists_val = "no (file not found)"
+
+    # timestamps
+    def _ts(v: str | None) -> str:
+        return v if v is not None else "-"
+
+    w = 15  # column label width (key + colon, left-aligned, values start at col 16)
+    lbl = lambda key: f"{key}:".ljust(w)
+
+    lines = [
+        f"{lbl('id')}{job['id']}",
+        f"{lbl('display')}{display}",
+        f"  {'submission:'.ljust(13)}{job['submission']}",
+        f"  {'execution:'.ljust(13)}{job['execution']}",
+        f"  {'readiness:'.ljust(13)}{job['readiness']}",
+        f"  {'session:'.ljust(13)}{job['session_mode']}",
+        f"{lbl('agent')}{job['agent']}",
+        f"{lbl('when')}{job['when']}",
+        f"{lbl('at_job_id')}{at_job_id_val}",
+        f"{lbl('depends_on')}{depends_on_val}",
+        f"{lbl('session_id')}{session_id_val}",
+        f"{lbl('cwd')}{job['cwd']}",
+        f"{lbl('log')}{job['log']}",
+        f"{lbl('prompt_file')}{job['prompt_file']}",
+        f"{lbl('prompt_exists')}{prompt_exists_val}",
+        f"{lbl('created_at')}{_ts(job.get('created_at'))}",
+        f"{lbl('updated_at')}{_ts(job.get('updated_at'))}",
+        f"{lbl('last_run_at')}{_ts(job.get('last_run_at'))}",
+    ]
+    return "\n".join(lines)
 
 
 def show_job(job: dict) -> None:
@@ -648,7 +818,8 @@ def change_session(job_id: str, interactive: bool = True) -> int:
     if not interactive:
         print("New session required.")
         return 1
-    new_session_id = choose_session(job["agent"])
+    job_cwd = Path(job["cwd"]) if job.get("cwd") else None
+    new_session_id = choose_session(job["agent"], cwd=job_cwd)
     new_mode = "resume" if new_session_id else "new"
 
     def mutate(d: dict) -> dict:
