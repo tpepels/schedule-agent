@@ -31,10 +31,6 @@ from .persistence import (
 )
 from .scheduler_backend import parse_at_job_id, remove_at_job, submit_job
 from .state_model import (
-    can_cancel,
-    can_change_session,
-    can_delete,
-    can_reschedule,
     can_retry,
     can_submit,
     derive_display_state,
