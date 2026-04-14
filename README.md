@@ -44,6 +44,7 @@ Also ensure the `atd` service is running.
 git clone <repo>
 cd schedule-agent
 ./install.sh
+```
 
 After installation:
 
