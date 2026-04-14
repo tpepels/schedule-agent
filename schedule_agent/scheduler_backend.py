@@ -45,8 +45,15 @@ def submit_job(job: dict, dry_run: bool = False) -> tuple[str | None, str]:
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "Failed to schedule job")
 
-    at_job_id = parse_at_job_id(proc.stdout)
-    return at_job_id, proc.stdout.strip()
+    # `at` writes its job confirmation ("job N at ...") to stderr on Linux;
+    # try stderr first, fall back to stdout for non-standard implementations.
+    at_job_id = parse_at_job_id(proc.stderr) or parse_at_job_id(proc.stdout)
+    output = (proc.stderr + proc.stdout).strip()
+
+    if at_job_id is None:
+        raise RuntimeError(f"Could not determine at job id from output: {output!r}")
+
+    return at_job_id, output
 
 
 def remove_at_job(at_job_id: str) -> tuple[bool, str]:

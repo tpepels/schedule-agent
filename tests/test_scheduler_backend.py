@@ -91,6 +91,7 @@ def test_submit_job_dry_run_returns_preview_and_does_not_call_subprocess(monkeyp
 # ---------------------------------------------------------------------------
 
 def test_submit_job_calls_at_and_returns_at_job_id(monkeypatch):
+    """at writes job confirmation to stderr (not stdout) on Linux."""
     captured = {}
 
     import schedule_agent.scheduler_backend as sb
@@ -98,7 +99,8 @@ def test_submit_job_calls_at_and_returns_at_job_id(monkeypatch):
     def fake_run(cmd, input=None, text=None, capture_output=None):
         captured["cmd"] = cmd
         captured["input"] = input
-        return _Proc(returncode=0, stdout="job 42 at Tue Apr 14 12:00:00 2026\n")
+        # Real `at` output: stderr has the job line, stdout is empty.
+        return _Proc(returncode=0, stdout="", stderr="job 42 at Tue Apr 14 12:00:00 2026\n")
 
     monkeypatch.setattr(sb.subprocess, "run", fake_run)
 
@@ -107,6 +109,32 @@ def test_submit_job_calls_at_and_returns_at_job_id(monkeypatch):
     assert captured["cmd"] == ["at", "03:00 tomorrow"]
     assert at_job_id == "42"
     assert "job 42" in output
+
+
+def test_submit_job_parses_at_job_id_from_stdout_if_stderr_empty(monkeypatch):
+    """Fall back to stdout parsing for non-standard at implementations."""
+    import schedule_agent.scheduler_backend as sb
+
+    monkeypatch.setattr(
+        sb.subprocess, "run",
+        lambda *a, **k: _Proc(returncode=0, stdout="job 7 at tomorrow\n", stderr=""),
+    )
+
+    at_job_id, output = submit_job(_job())
+    assert at_job_id == "7"
+
+
+def test_submit_job_raises_when_at_job_id_cannot_be_parsed(monkeypatch):
+    """Raise RuntimeError if at succeeds but we can't find the job id."""
+    import schedule_agent.scheduler_backend as sb
+
+    monkeypatch.setattr(
+        sb.subprocess, "run",
+        lambda *a, **k: _Proc(returncode=0, stdout="", stderr="warning: some unrelated message"),
+    )
+
+    with pytest.raises(RuntimeError, match="Could not determine at job id"):
+        submit_job(_job())
 
 
 def test_submit_job_raises_on_at_failure(monkeypatch):
