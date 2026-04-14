@@ -1,0 +1,180 @@
+Please inspect the current implementation after the state-model migration and test updates.
+
+Do not implement anything yet.
+
+You are producing a **CLI + interaction refinement plan** focused on making the state model fully visible, understandable, and safely actionable by the user.
+
+---
+
+## Goal
+
+Ensure that:
+
+* users can clearly see job state
+* users understand what actions are possible
+* users understand what each action will do (especially scheduler mutations)
+* all transitions are explicit, predictable, and reversible where possible
+
+This is not about adding features. This is about **making the model usable**.
+
+---
+
+## Scope
+
+Focus on:
+
+* CLI command outputs
+* CLI command semantics
+* state visibility
+* transition visibility
+* transition safety
+* consistency across commands
+* alignment with the transition engine
+
+---
+
+## Requirements
+
+### 1. State visibility
+
+Define how to display:
+
+* combined display state (primary)
+* raw state dimensions (secondary, when useful)
+
+For:
+
+```bash
+schedule-agent list
+schedule-agent show <id>
+```
+
+Decide:
+
+* what is shown inline
+* what is shown in detail view
+* when to expose:
+
+  * submission
+  * execution
+  * readiness
+  * session_mode
+
+---
+
+### 2. Transition visibility
+
+Every command that mutates state must clearly communicate:
+
+* current state
+* target state
+* what will happen to:
+
+  * `at_job_id`
+  * scheduling (`at` / `atrm`)
+  * execution state (reset or not)
+  * session
+
+Examples:
+
+```bash
+schedule-agent reschedule <id> "03:00 tomorrow"
+schedule-agent session <id> <session>
+schedule-agent retry <id>
+```
+
+---
+
+### 3. Safety messaging
+
+Define when and how to warn the user about:
+
+* unscheduling a running/scheduled job
+* resetting execution state
+* breaking dependency chains
+* overwriting session context
+
+Messages must be:
+
+* concise
+* deterministic
+* not interactive-confirmation heavy (this is a power tool)
+
+---
+
+### 4. Command surface refinement
+
+Evaluate current CLI:
+
+* list
+* show
+* delete
+* reschedule
+* session
+* retry
+* dependency notification
+
+Define:
+
+* which commands are correct
+* which need renaming
+* which need clearer semantics
+* which need to expose more state
+
+---
+
+### 5. Display state standard
+
+Define a consistent output format for:
+
+```bash
+schedule-agent list
+```
+
+Example direction:
+
+```text
+job1   scheduled   [claude] [resume]
+job2   waiting     [codex]  depends: job1
+job3   failed
+```
+
+Make this precise and consistent.
+
+---
+
+### 6. Edge cases
+
+Cover:
+
+* blocked jobs
+* orphaned scheduler jobs
+* missing prompt files
+* inconsistent states (should not happen, but must be handled)
+
+---
+
+### 7. Alignment with transition engine
+
+Ensure:
+
+* CLI never mutates raw state directly
+* all changes go through transition functions
+* CLI is a thin layer over transitions
+
+---
+
+## Output
+
+Return:
+
+1. CLI command refinements
+2. state display specification
+3. transition messaging rules
+4. example outputs (list + show + mutations)
+5. edge case handling
+6. implementation order
+
+Do not implement anything.
+
+Store the plan in /prompts/UI_UPDATE.md

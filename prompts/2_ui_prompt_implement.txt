@@ -1,0 +1,15 @@
+> **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan phase-by-phase. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+Execute the plan in `/prompts/UI_UPDATE.md` in full.
+
+Treat the plan as authoritative. Implement it end-to-end across code, tests, and documentation.
+
+Do not reinterpret, skip, or reorder steps. Do not stop at partial progress.
+
+Make reasonable assumptions where needed and continue without waiting for input.
+
+At the end, return:
+
+* a concise summary of what was implemented
+* confirmation that all steps are complete
+* any items that could not be completed (if applicable)

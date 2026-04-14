@@ -1,0 +1,237 @@
+Please update session discovery so it correctly handles both Claude and Codex session layouts.
+
+Do not make unrelated changes.
+
+---
+
+## Goal
+
+Fix session discovery so that:
+
+* Codex sessions are discovered recursively under the date-based subdirectory structure
+* Claude sessions are discovered relative to the current project, not just globally
+* session titles are extracted with a single shared function that accepts the agent name
+* the session chooser shows meaningful names instead of raw GUIDs
+* **title extraction is strict and truth-based only (no heuristics, no fallbacks)**
+
+---
+
+## Requirements
+
+### 1. Session discovery
+
+Replace the current naive implementation with agent-aware discovery.
+
+Current behavior is too naive:
+
+* for Codex, recursive discovery is broadly fine, but should filter to actual session files
+* for Claude, recursive discovery under `~/.claude/projects` is wrong because sessions are project-linked and should strongly prefer the current project
+
+Implement one public function:
+
+```python
+def discover_sessions(agent: str, cwd: Path | None = None, limit: int = 10) -> list[SessionInfo]:
+```
+
+with internal agent-specific logic.
+
+---
+
+### 2. Session model
+
+Introduce a richer session structure instead of returning raw `Path` objects.
+
+Use this model:
+
+```python
+from dataclasses import dataclass
+from pathlib import Path
+
+@dataclass
+class SessionInfo:
+    id: str
+    path: Path
+    agent: str
+    project: str | None
+    title: str | None
+    modified_at: float
+```
+
+---
+
+### 3. Codex discovery
+
+For Codex:
+
+* search under `~/.codex/sessions`
+* recurse through all date subdirectories
+* only include actual session files
+* sort by modification time descending
+* return the newest `limit`
+
+---
+
+### 4. Claude discovery
+
+For Claude:
+
+* search under `~/.claude/projects`
+* use the current working directory to determine which project directory should be preferred
+* prefer sessions for the current project first
+* then optionally fall back to the newest sessions from other projects if needed to fill the limit
+
+Do not just dump the globally newest Claude sessions.
+
+---
+
+### 5. Strict title extraction (no fallback)
+
+Implement one function:
+
+```python
+def extract_session_title(path: str, agent: str) -> str | None:
+```
+
+Rules:
+
+#### Claude
+
+* Only use `type == "ai-title"`
+* Extract `aiTitle`
+* Return it if present and non-empty
+* Otherwise return `None`
+
+#### Codex
+
+* Only use the first:
+
+  * `type == "event_msg"` AND `payload.type == "user_message"`
+* Extract `payload.message`
+* Return the first line
+* Otherwise return `None`
+
+### Important constraints
+
+* Do NOT parse arbitrary user content for Claude
+* Do NOT fallback to filenames inside the extractor
+* Do NOT clean, rewrite, or reinterpret titles
+* Extractor must be **truth-only**
+
+---
+
+### 6. Implementation
+
+Replace the existing extraction logic with:
+
+```python
+import json
+
+
+def extract_session_title(path: str, agent: str) -> str | None:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception:
+        return None
+
+    def iter_json():
+        for line in lines:
+            try:
+                yield json.loads(line)
+            except Exception:
+                continue
+
+    agent = agent.lower().strip()
+
+    if agent == "claude":
+        for obj in iter_json():
+            if obj.get("type") == "ai-title":
+                title = obj.get("aiTitle")
+                if isinstance(title, str):
+                    title = title.strip()
+                    if title:
+                        return title
+        return None
+
+    if agent == "codex":
+        for obj in iter_json():
+            if obj.get("type") == "event_msg":
+                payload = obj.get("payload", {})
+                if payload.get("type") == "user_message":
+                    message = payload.get("message")
+                    if isinstance(message, str):
+                        message = message.strip()
+                        if message:
+                            return message.splitlines()[0]
+        return None
+
+    return None
+```
+
+---
+
+### 7. Session chooser
+
+Update `choose_session()` so it uses titles but handles missing ones at the UI level.
+
+Example:
+
+```python
+def choose_session(agent: str, cwd: Path | None = None) -> str | None:
+    sessions = discover_sessions(agent, cwd=cwd)
+    if not sessions:
+        return None
+
+    labels = ["New session"] + [
+        f"{(s.title or '[no title]')} [{s.id[:8]}]"
+        for s in sessions
+    ]
+
+    selected = choose("Session", labels, default="New session")
+    if selected == "New session":
+        return None
+
+    for session, label in zip(sessions, labels[1:]):
+        if label == selected:
+            return session.id
+
+    return None
+```
+
+---
+
+### 8. Tests
+
+Add or update tests for:
+
+* Codex recursive discovery across date subdirectories
+* Claude project-aware preference behavior
+* strict title extraction for Claude (`ai-title`)
+* strict title extraction for Codex (`event_msg.user_message`)
+* extractor returns `None` when no title exists
+* chooser correctly displays `[no title]` when needed
+* Add tests to the external_interaction.py to test the latest versions of json files and if they still match the expected layout
+---
+
+## Output
+
+At the end return:
+
+1. files changed
+2. discovery behavior changed for Codex
+3. discovery behavior changed for Claude
+4. strict title extraction implemented
+5. tests added/updated
+6. commands run and results
+7. any assumptions made about Claude project directory matching
+
+---
+
+This prompt enforces:
+
+* strict extraction
+* clean separation of concerns
+* correct session discovery
+* no heuristic leakage
+
+Proceed with implementation.
