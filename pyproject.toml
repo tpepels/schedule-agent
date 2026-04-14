@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "schedule-agent"
+version = "0.1.0"
+description = "Schedule Codex and Claude CLI jobs with a prompt_toolkit terminal UI."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "prompt_toolkit>=3.0.43",
+]
+authors = [
+  { name = "Tom Pepels" }
+]
+keywords = ["scheduler", "codex", "claude", "cli", "agent"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+]
+
+[project.scripts]
+schedule-agent = "schedule_agent.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["schedule_agent*"]
