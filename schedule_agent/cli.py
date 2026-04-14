@@ -1051,6 +1051,37 @@ def cli_notify_dependency(job_id: str, parent_result: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Manual submit
+# ---------------------------------------------------------------------------
+
+def cli_submit_job(job_id: str) -> int:
+    jobs, idx, job = get_job_and_index(job_id)
+    if job is None:
+        print(f"error: job {job_id} not found")
+        return 1
+    if not can_submit(job):
+        display = derive_display_state(job)
+        print(f"error: job {job_id} is not in a submittable state")
+        print(f"  current: {display} (submission={job['submission']}, execution={job['execution']}, readiness={job['readiness']})")
+        print(f"  required: submission=queued, execution=pending, readiness=ready")
+        return 1
+    if not Path(job["prompt_file"]).exists():
+        print(f"error: prompt file not found: {job['prompt_file']}")
+        print(f"  job {job_id} cannot be submitted")
+        return 1
+    try:
+        output = schedule(job)
+        at_id = parse_at_job_id(output) or "?"
+        print(f"{job_id}: submitted")
+        print(f"  submission: queued \u2192 scheduled")
+        print(f"  at_job_id: {at_id}  (for: {job['when']})")
+        return 0
+    except RuntimeError as e:
+        print(f"error: failed to submit job {job_id}: {e}")
+        return 1
+
+
+# ---------------------------------------------------------------------------
 # Interactive create+submit flow
 # ---------------------------------------------------------------------------
 
@@ -1136,6 +1167,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     dep_p.add_argument("job_id")
     dep_p.add_argument("result", choices=["success", "failed"])
 
+    sub_p = sub.add_parser("submit", help="Submit a queued job to at.")
+    sub_p.add_argument("job_id")
+
     return parser
 
 
@@ -1173,6 +1207,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("mark requires a state: running, done, or failed")
         if args.command == "notify-dependency":
             return cli_notify_dependency(args.job_id, args.result)
+        if args.command == "submit":
+            return cli_submit_job(args.job_id)
 
         action = choose("Action", ["Create job", "Jobs"], default="Create job")
         if action == "Create job":

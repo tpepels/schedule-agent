@@ -527,6 +527,100 @@ def test_real_claude_session_format_matches_expected_layout(cli_module):
 
 
 # ---------------------------------------------------------------------------
+# cli_submit_job
+# ---------------------------------------------------------------------------
+
+def test_cli_submit_job_success(cli_module, tmp_path, monkeypatch, capsys):
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text("do something", encoding="utf-8")
+
+    job = _make_new_job(job_id="job-submit", prompt_file=str(prompt_file))
+    # make_job produces queued/pending/ready by default
+    cli_module.save_jobs([job])
+
+    def fake_schedule(j):
+        return "job 42 at 04:00 tomorrow"
+
+    monkeypatch.setattr(cli_module, "schedule", fake_schedule)
+
+    rc = cli_module.cli_submit_job("job-submit")
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "submitted" in out
+    assert "queued → scheduled" in out
+    assert "at_job_id: 42" in out
+
+
+def test_cli_submit_job_not_submittable(cli_module, tmp_path, monkeypatch, capsys):
+    from schedule_agent.transitions import on_submit
+
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text("do something", encoding="utf-8")
+
+    job = _make_new_job(job_id="job-sched", prompt_file=str(prompt_file))
+    job = on_submit(job, "99")  # now submission=scheduled
+    cli_module.save_jobs([job])
+
+    rc = cli_module.cli_submit_job("job-sched")
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "not in a submittable state" in out
+    assert "submission=" in out
+    assert "execution=" in out
+    assert "readiness=" in out
+    assert "required: submission=queued" in out
+
+
+def test_cli_submit_job_missing_prompt_file(cli_module, monkeypatch, capsys):
+    job = _make_new_job(job_id="job-noprompt", prompt_file="/nonexistent/path.md")
+    cli_module.save_jobs([job])
+
+    rc = cli_module.cli_submit_job("job-noprompt")
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "prompt file not found" in out
+    assert "/nonexistent/path.md" in out
+    assert "job-noprompt" in out
+
+
+def test_cli_submit_job_schedule_fails(cli_module, tmp_path, monkeypatch, capsys):
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text("do something", encoding="utf-8")
+
+    job = _make_new_job(job_id="job-fail-sched", prompt_file=str(prompt_file))
+    cli_module.save_jobs([job])
+
+    def fake_schedule(j):
+        raise RuntimeError("at command failed")
+
+    monkeypatch.setattr(cli_module, "schedule", fake_schedule)
+
+    rc = cli_module.cli_submit_job("job-fail-sched")
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "failed to submit job job-fail-sched" in out
+    assert "at command failed" in out
+
+
+def test_cli_submit_job_not_found(cli_module, capsys):
+    rc = cli_module.cli_submit_job("nonexistent-id")
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "nonexistent-id" in out
+
+
+def test_main_submit_subcommand_dispatches(cli_module, monkeypatch):
+    # Calling main with submit on nonexistent job should return 1
+    rc = cli_module.main(["submit", "nonexistent"])
+    assert rc == 1
+
+
+# ---------------------------------------------------------------------------
 # create_job
 # ---------------------------------------------------------------------------
 
