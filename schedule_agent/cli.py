@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import re
 import shlex
 import subprocess
 import tempfile
@@ -18,16 +16,61 @@ from prompt_toolkit.layout.containers import HSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.shortcuts import message_dialog, radiolist_dialog, yes_no_dialog
 
+from .execution import AGENTS, build_agent_cmd
+from .persistence import (
+    _data_home,
+    _ensure_dirs,
+    _state_home,
+    find_job,
+    load_jobs,
+    save_jobs,
+    update_job_in_list,
+    write_prompt_file as _write_prompt_file,
+)
+from .scheduler_backend import parse_at_job_id, remove_at_job, submit_job
+from .state_model import (
+    can_cancel,
+    can_change_session,
+    can_delete,
+    can_reschedule,
+    can_submit,
+    derive_display_state,
+)
+from .transitions import (
+    make_job as _make_job,
+    on_cancel,
+    on_change_session,
+    on_dependency_failure,
+    on_dependency_success,
+    on_failure,
+    on_reschedule,
+    on_retry,
+    on_start,
+    on_submit,
+    on_success,
+)
+
 
 APP_NAME = "schedule-agent"
 
 
-def _state_home() -> Path:
-    return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / APP_NAME
+# ---------------------------------------------------------------------------
+# Path helpers — thin wrappers kept for import compat and tests
+# ---------------------------------------------------------------------------
+
+def _state_home_fn() -> Path:  # noqa: D401
+    return _state_home()
 
 
-def _data_home() -> Path:
-    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / APP_NAME
+def _data_home_fn() -> Path:  # noqa: D401
+    return _data_home()
+
+
+# Re-expose paths the tests reference on the module
+def _make_paths():
+    state_dir = _state_home()
+    data_dir = _data_home()
+    return state_dir, data_dir, state_dir / "agent_queue.jsonl", state_dir / "agent_queue_state.json", data_dir / "agent_prompts"
 
 
 STATE_DIR = _state_home()
@@ -36,19 +79,18 @@ QUEUE_FILE = STATE_DIR / "agent_queue.jsonl"
 STATE_FILE = STATE_DIR / "agent_queue_state.json"
 PROMPT_DIR = DATA_DIR / "agent_prompts"
 
-AGENTS = {
-    "codex": {
-        "label": "Codex",
-        "bin": "codex",
-        "base_args": ["exec", "--dangerously-bypass-approvals-and-sandbox"],
-    },
-    "claude": {
-        "label": "Claude",
-        "bin": "claude",
-        "base_args": ["-p", "--dangerously-skip-permissions"],
-    },
-}
 
+# ---------------------------------------------------------------------------
+# Compatibility shims: build_cmd is now build_agent_cmd in execution.py
+# ---------------------------------------------------------------------------
+
+def build_cmd(job: dict) -> str:
+    return build_agent_cmd(job)
+
+
+# ---------------------------------------------------------------------------
+# UI helpers
+# ---------------------------------------------------------------------------
 
 def ts() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -78,12 +120,6 @@ def info(msg: str) -> None:
     message_dialog(title=APP_NAME, text=msg).run()
 
 
-def _ensure_dirs() -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    PROMPT_DIR.mkdir(parents=True, exist_ok=True)
-
-
 def _resolve_editor() -> list[str]:
     editor = os.environ.get("SCHEDULE_AGENT_EDITOR") or os.environ.get("EDITOR") or "nano"
     try:
@@ -93,51 +129,75 @@ def _resolve_editor() -> list[str]:
     return parts or ["nano"]
 
 
-def load_jobs():
-    _ensure_dirs()
-    if not QUEUE_FILE.exists():
-        return []
-    return [json.loads(line) for line in QUEUE_FILE.read_text(encoding="utf-8").splitlines() if line.strip()]
+# ---------------------------------------------------------------------------
+# Persistence wrappers (kept for test compatibility)
+# ---------------------------------------------------------------------------
+
+def load_state() -> dict:
+    """Load the legacy state file."""
+    from .persistence import load_legacy_state
+    return load_legacy_state()
 
 
-def save_jobs(jobs):
-    _ensure_dirs()
-    QUEUE_FILE.write_text("\n".join(json.dumps(j) for j in jobs), encoding="utf-8")
+def save_state(state: dict) -> None:
+    """Save the legacy state file."""
+    from .persistence import save_legacy_state
+    save_legacy_state(state)
 
 
-def load_state():
-    _ensure_dirs()
-    if not STATE_FILE.exists():
-        return {}
-    try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+def set_state(job_id: str, status: str, **extra) -> None:
+    """Update the legacy state file AND the job record's state fields.
 
+    Maps the old ``status`` value to new submission/execution fields in the
+    job record so both storage layers stay consistent during migration.
+    """
+    from .persistence import _STATUS_MAP, load_legacy_state, save_legacy_state
 
-def save_state(state):
-    _ensure_dirs()
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def set_state(job_id: str, status: str, **extra):
-    state = load_state()
+    # Update legacy state file
+    state = load_legacy_state()
     entry = state.get(job_id, {})
     entry["status"] = status
     entry["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     entry.update(extra)
     state[job_id] = entry
-    save_state(state)
+    save_legacy_state(state)
+
+    # Update the job record if it exists
+    jobs = load_jobs()
+    idx, job = find_job(jobs, job_id)
+    if job is None:
+        return
+
+    submission, execution = _STATUS_MAP.get(status, ("queued", "pending"))
+    updated = dict(job)
+    updated["submission"] = submission
+    updated["execution"] = execution
+    updated["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if "at_job_id" in extra:
+        updated["at_job_id"] = extra["at_job_id"]
+    elif submission != "scheduled":
+        updated["at_job_id"] = None
+    for k in ("scheduled_for", "log", "cwd", "agent"):
+        if k in extra:
+            updated[k] = extra[k]
+    jobs[idx] = updated
+    save_jobs(jobs)
 
 
-def clear_state(job_id: str):
-    state = load_state()
+def clear_state(job_id: str) -> None:
+    """Remove a job from the legacy state file."""
+    from .persistence import load_legacy_state, save_legacy_state
+    state = load_legacy_state()
     if job_id in state:
         del state[job_id]
-        save_state(state)
+        save_legacy_state(state)
 
 
-def discover_sessions(agent: str):
+# ---------------------------------------------------------------------------
+# Session discovery
+# ---------------------------------------------------------------------------
+
+def discover_sessions(agent: str) -> list[Path]:
     root = Path.home() / (".codex/sessions" if agent == "codex" else ".claude/projects")
     if not root.exists():
         return []
@@ -146,7 +206,7 @@ def discover_sessions(agent: str):
     return files[:10]
 
 
-def choose_session(agent: str):
+def choose_session(agent: str) -> str | None:
     sessions = discover_sessions(agent)
     if not sessions:
         return None
@@ -157,7 +217,7 @@ def choose_session(agent: str):
     return selected
 
 
-def choose_offset():
+def choose_offset() -> str:
     hours = [str(i) for i in range(0, 24)]
     minutes = [str(i) for i in range(0, 60)]
     h = int(choose("Offset hours", hours, default="0"))
@@ -166,7 +226,7 @@ def choose_offset():
     return f"now + {total} minutes"
 
 
-def resolve_time():
+def resolve_time() -> str:
     t = choose("When?", ["Offset", "Today", "Tomorrow"], default="Offset")
     if t == "Offset":
         return choose_offset()
@@ -175,7 +235,7 @@ def resolve_time():
     return f"{hh}:{mm}" if t == "Today" else f"{hh}:{mm} tomorrow"
 
 
-def read_prompt():
+def read_prompt() -> str:
     editor_cmd = _resolve_editor()
     with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as f:
         path = Path(f.name)
@@ -191,53 +251,76 @@ def read_prompt():
 
 def write_prompt_file(job_id: str, prompt: str) -> str:
     _ensure_dirs()
-    path = PROMPT_DIR / f"{job_id}.md"
-    path.write_text(prompt, encoding="utf-8")
-    return str(path)
+    prompt_dir = _data_home() / "agent_prompts"
+    return _write_prompt_file(prompt_dir, job_id, prompt)
 
 
-def build_cmd(job):
-    cfg = AGENTS[job["agent"]]
-    prompt_path = shlex.quote(job["prompt_file"])
-    base = " ".join(cfg["base_args"])
-    if job.get("session"):
-        if job["agent"] == "codex":
-            return f"{cfg['bin']} exec resume {shlex.quote(job['session'])} \"$(cat {prompt_path})\" < /dev/null"
-        return f"{cfg['bin']} --resume {shlex.quote(job['session'])} {base} \"$(cat {prompt_path})\" < /dev/null"
-    return f"{cfg['bin']} {base} \"$(cat {prompt_path})\" < /dev/null"
-
-
-def parse_at_job_id(stdout: str) -> str | None:
-    match = re.search(r"\bjob\s+(\d+)\s+at\b", stdout)
-    return match.group(1) if match else None
-
+# ---------------------------------------------------------------------------
+# Scheduler integration
+# ---------------------------------------------------------------------------
 
 def cancel_at_job(job_id: str) -> bool:
-    state = load_state()
-    entry = state.get(job_id, {})
-    at_job_id = entry.get("at_job_id")
-    if not at_job_id:
+    """Cancel the at job for job_id and update state.
+
+    Returns True if atrm succeeded (or job was not scheduled).
+    """
+    jobs = load_jobs()
+    _, job = find_job(jobs, job_id)
+    at_id = (job or {}).get("at_job_id")
+
+    # Also check legacy state file
+    if not at_id:
+        legacy = load_state()
+        at_id = legacy.get(job_id, {}).get("at_job_id")
+
+    if not at_id:
         return False
-    proc = subprocess.run(["atrm", str(at_job_id)], capture_output=True, text=True)
-    entry["at_job_removed"] = proc.returncode == 0
+
+    success, err = remove_at_job(at_id)
+
+    # Update legacy state file for compat
+    legacy = load_state()
+    entry = legacy.get(job_id, {})
+    entry["at_job_removed"] = success
     entry["at_job_remove_attempted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    if proc.stderr.strip():
-        entry["at_job_remove_error"] = proc.stderr.strip()
+    if err:
+        entry["at_job_remove_error"] = err
     entry.pop("at_job_id", None)
-    state[job_id] = entry
-    save_state(state)
-    return proc.returncode == 0
+    legacy[job_id] = entry
+    save_state(legacy)
+
+    # Update job record
+    if job is not None:
+        updated = dict(job)
+        updated["at_job_id"] = None
+        updated["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        save_jobs(update_job_in_list(jobs, updated))
+
+    return success
 
 
-def schedule(job, dry_run: bool = False):
-    cmd = build_cmd(job)
-    script = f"cd {shlex.quote(job['cwd'])}\nexport PATH=/usr/local/bin:/usr/bin:/bin\n{cmd} >> {shlex.quote(job['log'])} 2>&1\n"
+def schedule(job: dict, dry_run: bool = False) -> str:
+    """Submit job to `at` and persist state. Returns at output string.
+
+    On dry_run returns a preview string without touching at or state.
+    Raises RuntimeError if at fails.
+    """
+    at_job_id, output = submit_job(job, dry_run=dry_run)
+
     if dry_run:
-        return f"Would schedule at: {job['when']}\n\n{script}"
-    proc = subprocess.run(["at", job["when"]], input=script, text=True, capture_output=True)
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or "Failed to schedule job")
-    at_job_id = parse_at_job_id(proc.stdout)
+        return output
+
+    # Apply on_submit transition to the job record
+    updated_job = on_submit(job, at_job_id)
+    jobs = load_jobs()
+    idx, existing = find_job(jobs, job["id"])
+    if idx is not None:
+        jobs[idx] = updated_job
+    else:
+        jobs.append(updated_job)
+    save_jobs(jobs)
+
+    # Update legacy state file for compat
     set_state(
         job["id"],
         "submitted",
@@ -246,66 +329,96 @@ def schedule(job, dry_run: bool = False):
         cwd=job["cwd"],
         agent=job["agent"],
         at_job_id=at_job_id,
-        at_submitted_output=proc.stdout.strip(),
+        at_submitted_output=output,
     )
-    return proc.stdout.strip()
+    return output
 
 
-def create_job():
+# ---------------------------------------------------------------------------
+# Job creation
+# ---------------------------------------------------------------------------
+
+def create_job() -> dict:
     agent_label = choose("Agent", [cfg["label"] for cfg in AGENTS.values()], default="Codex")
     agent = "codex" if agent_label == "Codex" else "claude"
-    session = choose_session(agent)
+    session_id = choose_session(agent)
+    session_mode = "resume" if session_id else "new"
     info("A temporary file will open in your configured editor. Save and close it to continue. Leave it empty to cancel.")
     prompt = read_prompt()
     when = resolve_time()
     job_id = f"{agent}-{ts()}"
-    return {
-        "id": job_id,
-        "agent": agent,
-        "session": session,
-        "prompt_file": write_prompt_file(job_id, prompt),
-        "when": when,
-        "cwd": str(Path.cwd()),
-        "log": str(Path.cwd() / f"log-{ts()}.txt"),
-    }
+    prompt_file = write_prompt_file(job_id, prompt)
+    return _make_job(
+        job_id=job_id,
+        agent=agent,
+        session_mode=session_mode,
+        session_id=session_id,
+        prompt_file=prompt_file,
+        when=when,
+        cwd=str(Path.cwd()),
+        log=str(Path.cwd() / f"log-{ts()}.txt"),
+    )
 
 
-def format_job_label(job, state):
-    status = state.get(job["id"], {}).get("status")
-    submitted = " (S)" if status == "submitted" else ""
-    session = job.get("session") or "new"
-    return f"{job['id']}{submitted}  [{job['when']}]  [{job['agent']}]  [session={session}]"
+# ---------------------------------------------------------------------------
+# Display
+# ---------------------------------------------------------------------------
+
+def format_job_label(job: dict, state: dict | None = None) -> str:
+    """Format a one-line label for the job list UI.
+
+    ``state`` is the legacy state dict (keyed by job_id); it is used only
+    when the job itself has not yet been migrated to the new model.
+    """
+    display = derive_display_state(job)
+    display_tag = f" ({display.upper()[:1]})" if display != "queued" else ""
+    session_id = job.get("session_id") or job.get("session") or "new"
+    return f"{job['id']}{display_tag}  [{job['when']}]  [{job['agent']}]  [session={session_id}]"
 
 
 def list_jobs_noninteractive() -> str:
     jobs = load_jobs()
     if not jobs:
         return "No jobs."
-    state = load_state()
-    return "\n".join(format_job_label(job, state) for job in jobs)
+    return "\n".join(format_job_label(job) for job in jobs)
 
 
-def list_jobs():
+def list_jobs() -> None:
     info(list_jobs_noninteractive())
 
 
-def get_job_and_index(job_id: str):
+# ---------------------------------------------------------------------------
+# Job query helpers
+# ---------------------------------------------------------------------------
+
+def get_job_and_index(job_id: str) -> tuple[list, int | None, dict | None]:
     jobs = load_jobs()
-    for idx, job in enumerate(jobs):
-        if job["id"] == job_id:
-            return jobs, idx, job
-    return jobs, None, None
+    idx, job = find_job(jobs, job_id)
+    return jobs, idx, job
 
 
-def prepare_mutation(job_id: str):
-    state = load_state()
-    was_submitted = state.get(job_id, {}).get("status") == "submitted"
-    if was_submitted:
+def prepare_mutation(job_id: str) -> bool:
+    """Cancel the at job if the job is currently scheduled. Returns True if it was scheduled."""
+    jobs = load_jobs()
+    _, job = find_job(jobs, job_id)
+    if job is None:
+        return False
+    if job.get("submission") == "scheduled":
         cancel_at_job(job_id)
-    return was_submitted
+        return True
+    return False
 
 
-def apply_job_update(job_id: str, mutator: Callable[[dict], Optional[dict]], success_message: str | None = None, interactive: bool = True):
+# ---------------------------------------------------------------------------
+# Generic update
+# ---------------------------------------------------------------------------
+
+def apply_job_update(
+    job_id: str,
+    mutator: Callable[[dict], Optional[dict]],
+    success_message: str | None = None,
+    interactive: bool = True,
+) -> int:
     jobs, idx, job = get_job_and_index(job_id)
     if job is None:
         if interactive:
@@ -313,9 +426,16 @@ def apply_job_update(job_id: str, mutator: Callable[[dict], Optional[dict]], suc
         else:
             print("No such job.")
         return 1
-    was_submitted = prepare_mutation(job_id)
+
+    was_scheduled = job.get("submission") == "scheduled"
+    if was_scheduled:
+        cancel_at_job(job_id)
+        # Reload after cancel so job record is fresh
+        jobs, idx, job = get_job_and_index(job_id)
+
     updated = mutator(dict(job))
     if updated is None:
+        # Delete
         jobs = [j for j in jobs if j["id"] != job_id]
         save_jobs(jobs)
         clear_state(job_id)
@@ -328,9 +448,11 @@ def apply_job_update(job_id: str, mutator: Callable[[dict], Optional[dict]], suc
             else:
                 print(success_message)
         return 0
+
     jobs[idx] = updated
     save_jobs(jobs)
-    if was_submitted:
+
+    if was_scheduled:
         try:
             out = schedule(updated)
             msg = success_message or "Updated."
@@ -342,6 +464,16 @@ def apply_job_update(job_id: str, mutator: Callable[[dict], Optional[dict]], suc
                 print(msg)
             return 0
         except RuntimeError as e:
+            # Resubmit failed — leave as queued
+            updated_queued = dict(updated)
+            updated_queued["submission"] = "queued"
+            updated_queued["at_job_id"] = None
+            updated_queued["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _, reload_idx, _ = get_job_and_index(job_id)
+            if reload_idx is not None:
+                fresh_jobs = load_jobs()
+                fresh_jobs[reload_idx] = updated_queued
+                save_jobs(fresh_jobs)
             set_state(updated["id"], "queued", scheduled_for=updated["when"], log=updated["log"], cwd=updated["cwd"], agent=updated["agent"])
             msg = (success_message or "Updated.") + f"\n\n{e}\n\nThe job was updated, but re-submission failed. It remains queued."
             if interactive:
@@ -350,6 +482,7 @@ def apply_job_update(job_id: str, mutator: Callable[[dict], Optional[dict]], suc
                 print(msg)
             return 1
     else:
+        # Keep as queued, update scheduled_for in legacy state
         set_state(updated["id"], "queued", scheduled_for=updated["when"], log=updated["log"], cwd=updated["cwd"], agent=updated["agent"])
         if success_message:
             if interactive:
@@ -359,23 +492,26 @@ def apply_job_update(job_id: str, mutator: Callable[[dict], Optional[dict]], suc
         return 0
 
 
-def choose_job_action_from_list():
+# ---------------------------------------------------------------------------
+# Interactive job menu
+# ---------------------------------------------------------------------------
+
+def choose_job_action_from_list() -> tuple[str | None, dict | None]:
     jobs = load_jobs()
     if not jobs:
         info("No jobs.")
         return None, None
 
     selected_index = {"value": 0}
-    result = {"action": None, "job": None}
+    result: dict = {"action": None, "job": None}
 
     def get_text():
         jobs_now = load_jobs()
-        state_now = load_state()
         lines = []
         lines.append(("class:title", "Jobs\n"))
         lines.append(("class:hint", "Enter=view  R=reschedule  D=delete  C=change session  Q=quit\n\n"))
         for i, job in enumerate(jobs_now):
-            label = format_job_label(job, state_now)
+            label = format_job_label(job)
             prefix = "❯ " if i == selected_index["value"] else "  "
             style = "class:selected" if i == selected_index["value"] else ""
             lines.append((style, prefix + label + "\n"))
@@ -438,19 +574,20 @@ def choose_job_action_from_list():
     return result["action"], result["job"]
 
 
-def show_job_text(job) -> str:
+def show_job_text(job: dict) -> str:
+    session_id = job.get("session_id") or job.get("session") or "new"
     return (
         f"id:         {job['id']}\n"
         f"agent:      {job['agent']}\n"
         f"when:       {job['when']}\n"
-        f"session:    {job.get('session') or 'new'}\n"
+        f"session:    {session_id}\n"
         f"cwd:        {job['cwd']}\n"
         f"log:        {job['log']}\n"
         f"promptfile: {job['prompt_file']}"
     )
 
 
-def show_job(job):
+def show_job(job: dict) -> None:
     info(show_job_text(job))
 
 
@@ -463,8 +600,12 @@ def cli_show_job(job_id: str) -> int:
     return 0
 
 
-def reschedule_job(job_id: str, interactive: bool = True):
-    jobs, _, job = get_job_and_index(job_id)
+# ---------------------------------------------------------------------------
+# Non-interactive job actions
+# ---------------------------------------------------------------------------
+
+def reschedule_job(job_id: str, interactive: bool = True) -> int:
+    _, _, job = get_job_and_index(job_id)
     if job is None:
         if interactive:
             info("No such job.")
@@ -477,45 +618,43 @@ def reschedule_job(job_id: str, interactive: bool = True):
         print("New time required.")
         return 1
 
-    def mutate(d):
-        d["when"] = new_when
-        return d
+    def mutate(d: dict) -> dict:
+        return on_reschedule(d, new_when)
 
     return apply_job_update(job_id, mutate, success_message=f"Rescheduled {job_id} from {old_when} to {new_when}.", interactive=interactive)
 
 
 def cli_reschedule_job(job_id: str, new_when: str) -> int:
-    jobs, _, job = get_job_and_index(job_id)
+    _, _, job = get_job_and_index(job_id)
     if job is None:
         print("No such job.")
         return 1
     old_when = job["when"]
 
-    def mutate(d):
-        d["when"] = new_when
-        return d
+    def mutate(d: dict) -> dict:
+        return on_reschedule(d, new_when)
 
     return apply_job_update(job_id, mutate, success_message=f"Rescheduled {job_id} from {old_when} to {new_when}.", interactive=False)
 
 
-def change_session(job_id: str, interactive: bool = True):
-    jobs, _, job = get_job_and_index(job_id)
+def change_session(job_id: str, interactive: bool = True) -> int:
+    _, _, job = get_job_and_index(job_id)
     if job is None:
         if interactive:
             info("No such job.")
         else:
             print("No such job.")
         return 1
-    new_session = choose_session(job["agent"]) if interactive else None
-    if not interactive and new_session is None:
+    if not interactive:
         print("New session required.")
         return 1
+    new_session_id = choose_session(job["agent"])
+    new_mode = "resume" if new_session_id else "new"
 
-    def mutate(d):
-        d["session"] = new_session
-        return d
+    def mutate(d: dict) -> dict:
+        return on_change_session(d, new_mode, new_session_id)
 
-    return apply_job_update(job_id, mutate, success_message=f"Changed session for {job_id} to {new_session or 'new'}.", interactive=interactive)
+    return apply_job_update(job_id, mutate, success_message=f"Changed session for {job_id} to {new_session_id or 'new'}.", interactive=interactive)
 
 
 def cli_change_session(job_id: str, session: str | None) -> int:
@@ -523,15 +662,15 @@ def cli_change_session(job_id: str, session: str | None) -> int:
     if job is None:
         print("No such job.")
         return 1
+    session_mode = "resume" if session else "new"
 
-    def mutate(d):
-        d["session"] = session
-        return d
+    def mutate(d: dict) -> dict:
+        return on_change_session(d, session_mode, session)
 
     return apply_job_update(job_id, mutate, success_message=f"Changed session for {job_id} to {session or 'new'}.", interactive=False)
 
 
-def remove_job(job_id: str, interactive: bool = True):
+def remove_job(job_id: str, interactive: bool = True) -> int:
     if interactive:
         if not confirm(f"Delete {job_id}?", default=False):
             info("Cancelled.")
@@ -539,11 +678,82 @@ def remove_job(job_id: str, interactive: bool = True):
     return apply_job_update(job_id, lambda d: None, success_message="Deleted.", interactive=interactive)
 
 
-def create_and_maybe_submit(dry_run: bool = False):
+# ---------------------------------------------------------------------------
+# Automated transitions (called by the at wrapper script via CLI)
+# ---------------------------------------------------------------------------
+
+def cli_mark_running(job_id: str) -> int:
+    jobs, idx, job = get_job_and_index(job_id)
+    if job is None:
+        print(f"No such job: {job_id}")
+        return 1
+    updated = on_start(job)
+    jobs[idx] = updated
+    save_jobs(jobs)
+    return 0
+
+
+def cli_mark_done(job_id: str) -> int:
+    jobs, idx, job = get_job_and_index(job_id)
+    if job is None:
+        print(f"No such job: {job_id}")
+        return 1
+    updated = on_success(job)
+    jobs[idx] = updated
+    save_jobs(jobs)
+    return 0
+
+
+def cli_mark_failed(job_id: str) -> int:
+    jobs, idx, job = get_job_and_index(job_id)
+    if job is None:
+        print(f"No such job: {job_id}")
+        return 1
+    updated = on_failure(job)
+    jobs[idx] = updated
+    save_jobs(jobs)
+    return 0
+
+
+def cli_retry_job(job_id: str) -> int:
+    jobs, idx, job = get_job_and_index(job_id)
+    if job is None:
+        print(f"No such job: {job_id}")
+        return 1
+    updated = on_retry(job)
+    jobs[idx] = updated
+    save_jobs(jobs)
+    return 0
+
+
+def cli_notify_dependency(job_id: str, parent_result: str) -> int:
+    """Apply dependency transition based on parent outcome (success|failed)."""
+    jobs, idx, job = get_job_and_index(job_id)
+    if job is None:
+        print(f"No such job: {job_id}")
+        return 1
+    if parent_result == "success":
+        updated = on_dependency_success(job)
+    elif parent_result == "failed":
+        updated = on_dependency_failure(job)
+    else:
+        print(f"Unknown parent_result: {parent_result}")
+        return 1
+    jobs[idx] = updated
+    save_jobs(jobs)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Interactive create+submit flow
+# ---------------------------------------------------------------------------
+
+def create_and_maybe_submit(dry_run: bool = False) -> int:
     job = create_job()
     jobs = load_jobs()
     jobs.append(job)
     save_jobs(jobs)
+    # Mirror into legacy state as queued
     set_state(job["id"], "queued", log=job["log"], cwd=job["cwd"], agent=job["agent"])
     if dry_run:
         info(schedule(job, dry_run=True))
@@ -561,7 +771,7 @@ def create_and_maybe_submit(dry_run: bool = False):
         return 0
 
 
-def jobs_menu():
+def jobs_menu() -> int:
     while True:
         action, job = choose_job_action_from_list()
         if action in (None, "quit"):
@@ -578,6 +788,10 @@ def jobs_menu():
             change_session(job["id"])
 
 
+# ---------------------------------------------------------------------------
+# Arg parser
+# ---------------------------------------------------------------------------
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=APP_NAME, description="Schedule Codex and Claude CLI jobs.")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be scheduled during interactive create.")
@@ -592,17 +806,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     res_p = sub.add_parser("reschedule", help="Reschedule one job.")
     res_p.add_argument("job_id")
-    res_p.add_argument("when", help='New time, e.g. "tomorrow 03:00" is not valid for at; use "03:00 tomorrow" or "now + 90 minutes".')
+    res_p.add_argument("when", help='New time, e.g. "03:00 tomorrow" or "now + 90 minutes".')
 
     ses_p = sub.add_parser("session", help="Change session for one job.")
     ses_p.add_argument("job_id")
-    ses_p.add_argument("session", nargs="?", help='Session id, or omit with --new to clear to "new session".')
-    ses_p.add_argument("--new", action="store_true", help="Clear the session and use a new session.")
+    ses_p.add_argument("session", nargs="?", help="Session id, or omit with --new to clear.")
+    ses_p.add_argument("--new", action="store_true", help='Clear the session and use a new session.')
+
+    retry_p = sub.add_parser("retry", help="Reset a failed job so it can be submitted again.")
+    retry_p.add_argument("job_id")
+
+    # Automated transition commands (called by the at wrapper script)
+    mark_p = sub.add_parser("mark", help="Update job execution state (for at wrapper use).")
+    mark_sub = mark_p.add_subparsers(dest="mark_state")
+    for state in ("running", "done", "failed"):
+        mp = mark_sub.add_parser(state)
+        mp.add_argument("job_id")
+
+    dep_p = sub.add_parser("notify-dependency", help="Notify a child job of parent outcome.")
+    dep_p.add_argument("job_id")
+    dep_p.add_argument("result", choices=["success", "failed"])
 
     return parser
 
 
-def main(argv: Sequence[str] | None = None):
+def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
@@ -622,6 +850,18 @@ def main(argv: Sequence[str] | None = None):
             if args.session is None:
                 parser.error("session requires either a session id or --new")
             return cli_change_session(args.job_id, args.session)
+        if args.command == "retry":
+            return cli_retry_job(args.job_id)
+        if args.command == "mark":
+            if args.mark_state == "running":
+                return cli_mark_running(args.job_id)
+            if args.mark_state == "done":
+                return cli_mark_done(args.job_id)
+            if args.mark_state == "failed":
+                return cli_mark_failed(args.job_id)
+            parser.error("mark requires a state: running, done, or failed")
+        if args.command == "notify-dependency":
+            return cli_notify_dependency(args.job_id, args.result)
 
         action = choose("Action", ["Create job", "Jobs"], default="Create job")
         if action == "Create job":

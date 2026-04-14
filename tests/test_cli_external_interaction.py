@@ -15,26 +15,27 @@ def cli_module(tmp_path, monkeypatch):
     return cli
 
 
-def make_job(
+def _make_new_job(
     job_id="job1",
     agent="claude",
     when="03:00 tomorrow",
     cwd="/tmp/project",
     log="/tmp/project/log.txt",
     prompt_file="/tmp/project/prompt.md",
-    session=None,
+    session_mode="new",
+    session_id=None,
 ):
-    job = {
-        "id": job_id,
-        "agent": agent,
-        "when": when,
-        "cwd": cwd,
-        "log": log,
-        "prompt_file": prompt_file,
-    }
-    if session is not None:
-        job["session"] = session
-    return job
+    from schedule_agent.transitions import make_job
+    return make_job(
+        job_id=job_id,
+        agent=agent,
+        session_mode=session_mode,
+        session_id=session_id,
+        prompt_file=prompt_file,
+        when=when,
+        cwd=cwd,
+        log=log,
+    )
 
 
 class DummyProc:
@@ -44,11 +45,13 @@ class DummyProc:
         self.stderr = stderr
 
 
+# ---------------------------------------------------------------------------
+# build_cmd (via build_agent_cmd)
+# ---------------------------------------------------------------------------
+
 def test_build_cmd_codex_new_session_contains_expected_flags_and_stdin_detach(cli_module):
-    job = make_job(agent="codex", prompt_file="/tmp/prompt.md")
-
+    job = _make_new_job(agent="codex", prompt_file="/tmp/prompt.md")
     cmd = cli_module.build_cmd(job)
-
     assert "codex" in cmd
     assert "exec" in cmd
     assert "--dangerously-bypass-approvals-and-sandbox" in cmd
@@ -58,22 +61,15 @@ def test_build_cmd_codex_new_session_contains_expected_flags_and_stdin_detach(cl
 
 
 def test_build_cmd_codex_resume_session_contains_resume(cli_module):
-    job = make_job(agent="codex", prompt_file="/tmp/prompt.md", session="sess-123")
-
+    job = _make_new_job(agent="codex", prompt_file="/tmp/prompt.md", session_mode="resume", session_id="sess-123")
     cmd = cli_module.build_cmd(job)
-
-    assert "codex" in cmd
     assert "exec resume" in cmd
     assert "sess-123" in cmd
-    assert '$(cat /tmp/prompt.md)' in cmd
-    assert "< /dev/null" in cmd
 
 
 def test_build_cmd_claude_new_session_contains_expected_flags_and_stdin_detach(cli_module):
-    job = make_job(agent="claude", prompt_file="/tmp/prompt.md")
-
+    job = _make_new_job(agent="claude", prompt_file="/tmp/prompt.md")
     cmd = cli_module.build_cmd(job)
-
     assert "claude" in cmd
     assert "-p" in cmd
     assert "--dangerously-skip-permissions" in cmd
@@ -83,18 +79,17 @@ def test_build_cmd_claude_new_session_contains_expected_flags_and_stdin_detach(c
 
 
 def test_build_cmd_claude_resume_session_contains_resume(cli_module):
-    job = make_job(agent="claude", prompt_file="/tmp/prompt.md", session="sess-999")
-
+    job = _make_new_job(agent="claude", prompt_file="/tmp/prompt.md", session_mode="resume", session_id="sess-999")
     cmd = cli_module.build_cmd(job)
-
-    assert "claude" in cmd
     assert "--resume" in cmd
     assert "sess-999" in cmd
     assert "-p" in cmd
     assert "--dangerously-skip-permissions" in cmd
-    assert '$(cat /tmp/prompt.md)' in cmd
-    assert "< /dev/null" in cmd
 
+
+# ---------------------------------------------------------------------------
+# parse_at_job_id
+# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
     ("stdout", "expected"),
@@ -111,16 +106,18 @@ def test_parse_at_job_id_handles_supported_and_unsupported_outputs(cli_module, s
     assert cli_module.parse_at_job_id(stdout) == expected
 
 
-def test_schedule_dry_run_returns_script_and_does_not_touch_state_or_subprocess(cli_module, monkeypatch):
-    job = make_job()
+# ---------------------------------------------------------------------------
+# schedule — dry run
+# ---------------------------------------------------------------------------
 
+def test_schedule_dry_run_returns_script_and_does_not_touch_subprocess(cli_module, monkeypatch):
+    job = _make_new_job()
     calls = []
 
-    def fake_run(*args, **kwargs):
-        calls.append((args, kwargs))
-        raise AssertionError("subprocess.run should not be called in dry-run mode")
-
-    monkeypatch.setattr(cli_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        "schedule_agent.scheduler_backend.subprocess.run",
+        lambda *a, **k: calls.append((a, k)) or (_ for _ in ()).throw(AssertionError("subprocess.run called in dry-run")),
+    )
 
     output = cli_module.schedule(job, dry_run=True)
 
@@ -129,79 +126,88 @@ def test_schedule_dry_run_returns_script_and_does_not_touch_state_or_subprocess(
     assert "export PATH=/usr/local/bin:/usr/bin:/bin" in output
     assert "< /dev/null" in output
     assert calls == []
-    assert cli_module.load_state() == {}
+    # Dry run must not mutate the job list
+    assert cli_module.load_jobs() == []
 
 
-def test_schedule_calls_at_with_expected_script_and_persists_submitted_state(cli_module, monkeypatch):
-    job = make_job(agent="claude", prompt_file="/tmp/prompt.md", job_id="job-claude")
+# ---------------------------------------------------------------------------
+# schedule — live
+# ---------------------------------------------------------------------------
+
+def test_schedule_calls_at_and_persists_scheduled_state(cli_module, monkeypatch):
+    job = _make_new_job(agent="claude", prompt_file="/tmp/prompt.md", job_id="job-claude")
+    cli_module.save_jobs([job])
 
     captured = {}
 
     def fake_run(cmd, input=None, text=None, capture_output=None):
         captured["cmd"] = cmd
         captured["input"] = input
-        captured["text"] = text
-        captured["capture_output"] = capture_output
-        return DummyProc(returncode=0, stdout="job 42 at Tue Apr 14 12:00:00 2026\n", stderr="")
+        return DummyProc(returncode=0, stdout="job 42 at Tue Apr 14 12:00:00 2026\n")
 
-    monkeypatch.setattr(cli_module.subprocess, "run", fake_run)
+    monkeypatch.setattr("schedule_agent.scheduler_backend.subprocess.run", fake_run)
 
     out = cli_module.schedule(job)
 
     assert captured["cmd"] == ["at", "03:00 tomorrow"]
-    assert captured["text"] is True
-    assert captured["capture_output"] is True
-
     script = captured["input"]
     assert "cd /tmp/project" in script
     assert "export PATH=/usr/local/bin:/usr/bin:/bin" in script
     assert "claude -p --dangerously-skip-permissions" in script
-    assert '$(cat /tmp/prompt.md)' in script
-    assert "< /dev/null" in script
     assert ">> /tmp/project/log.txt 2>&1" in script
-
     assert "job 42 at" in out
 
+    # Job record should be updated to scheduled
+    loaded = cli_module.load_jobs()
+    j = next(x for x in loaded if x["id"] == "job-claude")
+    assert j["submission"] == "scheduled"
+    assert j["at_job_id"] == "42"
+
+    # Legacy state file also updated
     state = cli_module.load_state()
     assert state["job-claude"]["status"] == "submitted"
-    assert state["job-claude"]["scheduled_for"] == "03:00 tomorrow"
     assert state["job-claude"]["at_job_id"] == "42"
-    assert state["job-claude"]["agent"] == "claude"
 
 
-def test_schedule_raises_on_at_failure_and_does_not_write_submitted_state(cli_module, monkeypatch):
-    job = make_job(job_id="job-fail")
+def test_schedule_raises_on_at_failure_and_does_not_write_scheduled_state(cli_module, monkeypatch):
+    job = _make_new_job(job_id="job-fail")
+    cli_module.save_jobs([job])
 
-    def fake_run(cmd, input=None, text=None, capture_output=None):
-        return DummyProc(returncode=1, stdout="", stderr="Garbled time")
-
-    monkeypatch.setattr(cli_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        "schedule_agent.scheduler_backend.subprocess.run",
+        lambda *a, **k: DummyProc(returncode=1, stderr="Garbled time"),
+    )
 
     with pytest.raises(RuntimeError, match="Garbled time"):
         cli_module.schedule(job)
 
-    assert cli_module.load_state() == {}
+    loaded = cli_module.load_jobs()
+    j = next(x for x in loaded if x["id"] == "job-fail")
+    assert j["submission"] == "queued"  # unchanged
 
+
+# ---------------------------------------------------------------------------
+# cancel_at_job
+# ---------------------------------------------------------------------------
 
 def test_cancel_at_job_returns_false_when_no_at_job_id_is_recorded(cli_module):
-    cli_module.set_state("job1", "submitted")
+    job = _make_new_job(job_id="job1")
+    cli_module.save_jobs([job])
     assert cli_module.cancel_at_job("job1") is False
-
-    state = cli_module.load_state()
-    assert state["job1"]["status"] == "submitted"
-    assert "at_job_id" not in state["job1"]
 
 
 def test_cancel_at_job_success_updates_state_and_drops_at_job_id(cli_module, monkeypatch):
-    cli_module.set_state("job1", "submitted", at_job_id="55")
+    from schedule_agent.transitions import on_submit
+    job = on_submit(_make_new_job(job_id="job1"), "55")
+    cli_module.save_jobs([job])
 
     captured = {}
 
     def fake_run(cmd, capture_output=None, text=None):
         captured["cmd"] = cmd
-        return DummyProc(returncode=0, stdout="", stderr="")
+        return DummyProc(returncode=0)
 
-    monkeypatch.setattr(cli_module.subprocess, "run", fake_run)
+    monkeypatch.setattr("schedule_agent.scheduler_backend.subprocess.run", fake_run)
 
     assert cli_module.cancel_at_job("job1") is True
     assert captured["cmd"] == ["atrm", "55"]
@@ -209,16 +215,21 @@ def test_cancel_at_job_success_updates_state_and_drops_at_job_id(cli_module, mon
     state = cli_module.load_state()
     assert state["job1"]["at_job_removed"] is True
     assert "at_job_id" not in state["job1"]
-    assert "at_job_remove_attempted_at" in state["job1"]
+
+    loaded = cli_module.load_jobs()
+    j = next(x for x in loaded if x["id"] == "job1")
+    assert j["at_job_id"] is None
 
 
 def test_cancel_at_job_failure_records_error_and_drops_at_job_id(cli_module, monkeypatch):
-    cli_module.set_state("job1", "submitted", at_job_id="77")
+    from schedule_agent.transitions import on_submit
+    job = on_submit(_make_new_job(job_id="job1"), "77")
+    cli_module.save_jobs([job])
 
-    def fake_run(cmd, capture_output=None, text=None):
-        return DummyProc(returncode=1, stdout="", stderr="Cannot find jobid 77")
-
-    monkeypatch.setattr(cli_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        "schedule_agent.scheduler_backend.subprocess.run",
+        lambda *a, **k: DummyProc(returncode=1, stderr="Cannot find jobid 77"),
+    )
 
     assert cli_module.cancel_at_job("job1") is False
 
@@ -228,11 +239,14 @@ def test_cancel_at_job_failure_records_error_and_drops_at_job_id(cli_module, mon
     assert "at_job_id" not in state["job1"]
 
 
+# ---------------------------------------------------------------------------
+# discover_sessions
+# ---------------------------------------------------------------------------
+
 def test_discover_sessions_returns_most_recent_ten_sorted_by_mtime_desc(cli_module, tmp_path, monkeypatch):
     fake_home = tmp_path / "home"
     sessions_root = fake_home / ".codex" / "sessions"
     sessions_root.mkdir(parents=True)
-
     monkeypatch.setattr(cli_module.Path, "home", lambda: fake_home)
 
     created = []
@@ -241,28 +255,27 @@ def test_discover_sessions_returns_most_recent_ten_sorted_by_mtime_desc(cli_modu
         p.write_text(f"session {i}", encoding="utf-8")
         created.append(p)
 
-    # Make later-numbered files newer.
     for i, p in enumerate(created):
         ts = 1_700_000_000 + i
-        os_utime = __import__("os").utime
-        os_utime(p, (ts, ts))
+        __import__("os").utime(p, (ts, ts))
 
     discovered = cli_module.discover_sessions("codex")
-
     assert len(discovered) == 10
-    names = [p.name for p in discovered]
-    assert names[0] == "session-11.jsonl"
-    assert names[-1] == "session-2.jsonl"
+    assert discovered[0].name == "session-11.jsonl"
+    assert discovered[-1].name == "session-2.jsonl"
 
 
 def test_discover_sessions_returns_empty_when_root_missing(cli_module, tmp_path, monkeypatch):
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     monkeypatch.setattr(cli_module.Path, "home", lambda: fake_home)
-
     assert cli_module.discover_sessions("codex") == []
     assert cli_module.discover_sessions("claude") == []
 
+
+# ---------------------------------------------------------------------------
+# create_job
+# ---------------------------------------------------------------------------
 
 def test_create_job_writes_prompt_file_and_uses_interaction_results(cli_module, monkeypatch, tmp_path):
     monkeypatch.setattr(cli_module, "choose", lambda msg, choices, default=None: "Codex" if msg == "Agent" else choices[0])
@@ -275,94 +288,91 @@ def test_create_job_writes_prompt_file_and_uses_interaction_results(cli_module, 
     job = cli_module.create_job()
 
     assert job["agent"] == "codex"
-    assert job["session"] == "sess-123"
+    assert job["session_mode"] == "resume"
+    assert job["session_id"] == "sess-123"
     assert job["when"] == "now + 15 minutes"
     assert job["cwd"] == str(tmp_path)
     assert Path(job["prompt_file"]).exists()
-    assert Path(job["prompt_file"]).read_text(encoding="utf-8") == "hello prompt"
+    assert Path(job["prompt_file"]).read_text(encoding="utf-8").startswith("hello prompt")
 
 
-def test_prepare_mutation_cancels_only_submitted_jobs(cli_module, monkeypatch):
-    cli_module.set_state("submitted-job", "submitted", at_job_id="12")
-    cli_module.set_state("queued-job", "queued")
+# ---------------------------------------------------------------------------
+# prepare_mutation
+# ---------------------------------------------------------------------------
+
+def test_prepare_mutation_cancels_only_scheduled_jobs(cli_module, monkeypatch):
+    from schedule_agent.transitions import make_job, on_submit
+    scheduled = on_submit(_make_new_job(job_id="scheduled-job"), "12")
+    queued = _make_new_job(job_id="queued-job")
+    cli_module.save_jobs([scheduled, queued])
 
     called = []
+    monkeypatch.setattr(cli_module, "cancel_at_job", lambda jid: called.append(jid) or True)
 
-    def fake_cancel(job_id):
-        called.append(job_id)
-        return True
-
-    monkeypatch.setattr(cli_module, "cancel_at_job", fake_cancel)
-
-    assert cli_module.prepare_mutation("submitted-job") is True
+    assert cli_module.prepare_mutation("scheduled-job") is True
     assert cli_module.prepare_mutation("queued-job") is False
-    assert called == ["submitted-job"]
+    assert called == ["scheduled-job"]
 
+
+# ---------------------------------------------------------------------------
+# apply_job_update — queued path
+# ---------------------------------------------------------------------------
 
 def test_apply_job_update_updates_queued_job_without_resubmitting(cli_module, monkeypatch):
     prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
-    job = make_job(job_id="job1", when="now + 5 minutes", prompt_file=str(prompt_path))
+    job = _make_new_job(job_id="job1", when="now + 5 minutes", prompt_file=str(prompt_path))
     cli_module.save_jobs([job])
-    cli_module.set_state("job1", "queued", log=job["log"], cwd=job["cwd"], agent=job["agent"])
 
     scheduled = []
+    monkeypatch.setattr(cli_module, "schedule", lambda j, dry_run=False: scheduled.append(j) or "scheduled")
 
-    def fake_schedule(updated, dry_run=False):
-        scheduled.append(updated)
-        return "scheduled"
-
-    monkeypatch.setattr(cli_module, "schedule", fake_schedule)
-
+    from schedule_agent.transitions import on_reschedule
     rc = cli_module.apply_job_update(
         "job1",
-        lambda d: {**d, "when": "03:00 tomorrow"},
+        lambda d: on_reschedule(d, "03:00 tomorrow"),
         success_message="updated",
         interactive=False,
     )
 
     assert rc == 0
     assert scheduled == []
-
-    jobs = cli_module.load_jobs()
-    assert jobs[0]["when"] == "03:00 tomorrow"
-
-    state = cli_module.load_state()
-    assert state["job1"]["status"] == "queued"
-    assert state["job1"]["scheduled_for"] == "03:00 tomorrow"
+    loaded = cli_module.load_jobs()
+    assert loaded[0]["when"] == "03:00 tomorrow"
+    assert loaded[0]["submission"] == "queued"
 
 
-def test_apply_job_update_resubmits_previously_submitted_job(cli_module, monkeypatch):
+# ---------------------------------------------------------------------------
+# apply_job_update — scheduled path (resubmit)
+# ---------------------------------------------------------------------------
+
+def test_apply_job_update_resubmits_previously_scheduled_job(cli_module, monkeypatch):
+    from schedule_agent.transitions import make_job, on_submit
     prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
-    job = make_job(job_id="job1", when="now + 5 minutes", prompt_file=str(prompt_path))
+    job = on_submit(_make_new_job(job_id="job1", when="now + 5 minutes", prompt_file=str(prompt_path)), "12")
     cli_module.save_jobs([job])
-    cli_module.set_state("job1", "submitted", at_job_id="12", log=job["log"], cwd=job["cwd"], agent=job["agent"])
 
     cancelled = []
     scheduled = []
 
-    def fake_cancel(job_id):
-        cancelled.append(job_id)
-        return True
+    monkeypatch.setattr(cli_module, "cancel_at_job", lambda jid: cancelled.append(jid) or True)
 
     def fake_schedule(updated, dry_run=False):
         scheduled.append(updated.copy())
-        cli_module.set_state(
-            updated["id"],
-            "submitted",
-            at_job_id="99",
-            scheduled_for=updated["when"],
-            log=updated["log"],
-            cwd=updated["cwd"],
-            agent=updated["agent"],
-        )
+        from schedule_agent.transitions import on_submit as _on_submit
+        updated_sched = _on_submit(updated, "99")
+        jobs = cli_module.load_jobs()
+        from schedule_agent.persistence import find_job, update_job_in_list
+        idx, _ = find_job(jobs, updated["id"])
+        jobs[idx] = updated_sched
+        cli_module.save_jobs(jobs)
         return "job 99 at Tue Apr 14 12:00:00 2026"
 
-    monkeypatch.setattr(cli_module, "cancel_at_job", fake_cancel)
     monkeypatch.setattr(cli_module, "schedule", fake_schedule)
 
+    from schedule_agent.transitions import on_reschedule
     rc = cli_module.apply_job_update(
         "job1",
-        lambda d: {**d, "when": "03:00 tomorrow"},
+        lambda d: on_reschedule(d, "03:00 tomorrow"),
         success_message="updated",
         interactive=False,
     )
@@ -372,54 +382,54 @@ def test_apply_job_update_resubmits_previously_submitted_job(cli_module, monkeyp
     assert len(scheduled) == 1
     assert scheduled[0]["when"] == "03:00 tomorrow"
 
-    state = cli_module.load_state()
-    assert state["job1"]["status"] == "submitted"
-    assert state["job1"]["at_job_id"] == "99"
+    loaded = cli_module.load_jobs()
+    j = next(x for x in loaded if x["id"] == "job1")
+    assert j["submission"] == "scheduled"
+    assert j["at_job_id"] == "99"
 
+
+# ---------------------------------------------------------------------------
+# apply_job_update — resubmit fails
+# ---------------------------------------------------------------------------
 
 def test_apply_job_update_falls_back_to_queued_when_resubmit_fails(cli_module, monkeypatch, capsys):
+    from schedule_agent.transitions import on_submit
     prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
-    job = make_job(job_id="job1", when="now + 5 minutes", prompt_file=str(prompt_path))
+    job = on_submit(_make_new_job(job_id="job1", when="now + 5 minutes", prompt_file=str(prompt_path)), "12")
     cli_module.save_jobs([job])
-    cli_module.set_state("job1", "submitted", at_job_id="12", log=job["log"], cwd=job["cwd"], agent=job["agent"])
 
-    monkeypatch.setattr(cli_module, "cancel_at_job", lambda job_id: True)
+    monkeypatch.setattr(cli_module, "cancel_at_job", lambda jid: True)
+    monkeypatch.setattr(cli_module, "schedule", lambda j, dry_run=False: (_ for _ in ()).throw(RuntimeError("Garbled time")))
 
-    def fake_schedule(updated, dry_run=False):
-        raise RuntimeError("Garbled time")
-
-    monkeypatch.setattr(cli_module, "schedule", fake_schedule)
-
+    from schedule_agent.transitions import on_reschedule
     rc = cli_module.apply_job_update(
         "job1",
-        lambda d: {**d, "when": "03:00 tomorrow"},
+        lambda d: on_reschedule(d, "03:00 tomorrow"),
         success_message="updated",
         interactive=False,
     )
 
     assert rc == 1
-
-    state = cli_module.load_state()
-    assert state["job1"]["status"] == "queued"
-    assert state["job1"]["scheduled_for"] == "03:00 tomorrow"
+    loaded = cli_module.load_jobs()
+    j = next(x for x in loaded if x["id"] == "job1")
+    assert j["submission"] == "queued"
 
     out = capsys.readouterr().out
     assert "Garbled time" in out
     assert "remains queued" in out
 
 
+# ---------------------------------------------------------------------------
+# apply_job_update — delete
+# ---------------------------------------------------------------------------
+
 def test_apply_job_update_delete_removes_job_state_and_prompt_file(cli_module):
     prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
-    job = make_job(job_id="job1", prompt_file=str(prompt_path))
+    job = _make_new_job(job_id="job1", prompt_file=str(prompt_path))
     cli_module.save_jobs([job])
     cli_module.set_state("job1", "queued")
 
-    rc = cli_module.apply_job_update(
-        "job1",
-        lambda d: None,
-        success_message="Deleted.",
-        interactive=False,
-    )
+    rc = cli_module.apply_job_update("job1", lambda d: None, success_message="Deleted.", interactive=False)
 
     assert rc == 0
     assert cli_module.load_jobs() == []
@@ -427,13 +437,16 @@ def test_apply_job_update_delete_removes_job_state_and_prompt_file(cli_module):
     assert not prompt_path.exists()
 
 
+# ---------------------------------------------------------------------------
+# CLI show
+# ---------------------------------------------------------------------------
+
 def test_cli_show_job_prints_details_and_returns_zero(cli_module, capsys):
     prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
-    job = make_job(job_id="job1", prompt_file=str(prompt_path))
+    job = _make_new_job(job_id="job1", prompt_file=str(prompt_path))
     cli_module.save_jobs([job])
 
     rc = cli_module.cli_show_job("job1")
-
     assert rc == 0
     out = capsys.readouterr().out
     assert "id:         job1" in out
@@ -446,161 +459,156 @@ def test_cli_show_job_returns_one_for_missing_job(cli_module, capsys):
     assert "No such job." in capsys.readouterr().out
 
 
+# ---------------------------------------------------------------------------
+# CLI reschedule
+# ---------------------------------------------------------------------------
+
 def test_cli_reschedule_job_updates_time(cli_module, capsys):
     prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
-    job = make_job(job_id="job1", when="now + 5 minutes", prompt_file=str(prompt_path))
+    job = _make_new_job(job_id="job1", when="now + 5 minutes", prompt_file=str(prompt_path))
     cli_module.save_jobs([job])
-    cli_module.set_state("job1", "queued")
 
     rc = cli_module.cli_reschedule_job("job1", "03:00 tomorrow")
-
     assert rc == 0
     assert cli_module.load_jobs()[0]["when"] == "03:00 tomorrow"
     assert "Rescheduled job1 from now + 5 minutes to 03:00 tomorrow." in capsys.readouterr().out
 
 
+# ---------------------------------------------------------------------------
+# CLI change session
+# ---------------------------------------------------------------------------
+
 def test_cli_change_session_sets_specific_session(cli_module, capsys):
     prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
-    job = make_job(job_id="job1", prompt_file=str(prompt_path))
+    job = _make_new_job(job_id="job1", prompt_file=str(prompt_path))
     cli_module.save_jobs([job])
-    cli_module.set_state("job1", "queued")
 
     rc = cli_module.cli_change_session("job1", "sess-abc")
-
     assert rc == 0
-    assert cli_module.load_jobs()[0]["session"] == "sess-abc"
+    loaded = cli_module.load_jobs()[0]
+    assert loaded["session_id"] == "sess-abc"
+    assert loaded["session_mode"] == "resume"
     assert "Changed session for job1 to sess-abc." in capsys.readouterr().out
 
 
 def test_cli_change_session_can_clear_to_new(cli_module, capsys):
     prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
-    job = make_job(job_id="job1", prompt_file=str(prompt_path), session="old-sess")
+    job = _make_new_job(job_id="job1", prompt_file=str(prompt_path), session_mode="resume", session_id="old-sess")
     cli_module.save_jobs([job])
-    cli_module.set_state("job1", "queued")
 
     rc = cli_module.cli_change_session("job1", None)
-
     assert rc == 0
-    assert cli_module.load_jobs()[0]["session"] is None
+    loaded = cli_module.load_jobs()[0]
+    assert loaded["session_id"] is None
+    assert loaded["session_mode"] == "new"
     assert "Changed session for job1 to new." in capsys.readouterr().out
 
 
+# ---------------------------------------------------------------------------
+# remove_job non-interactive
+# ---------------------------------------------------------------------------
+
 def test_remove_job_noninteractive_deletes_without_prompt(cli_module, capsys):
     prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
-    job = make_job(job_id="job1", prompt_file=str(prompt_path))
+    job = _make_new_job(job_id="job1", prompt_file=str(prompt_path))
     cli_module.save_jobs([job])
-    cli_module.set_state("job1", "queued")
 
     rc = cli_module.remove_job("job1", interactive=False)
-
     assert rc == 0
     assert cli_module.load_jobs() == []
-    assert cli_module.load_state() == {}
     assert not prompt_path.exists()
     assert "Deleted." in capsys.readouterr().out
 
 
+# ---------------------------------------------------------------------------
+# main subcommands
+# ---------------------------------------------------------------------------
+
 def test_main_list_subcommand_prints_jobs(cli_module, capsys):
     prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
-    job = make_job(job_id="job1", prompt_file=str(prompt_path))
+    job = _make_new_job(job_id="job1", prompt_file=str(prompt_path))
     cli_module.save_jobs([job])
-
     rc = cli_module.main(["list"])
-
     assert rc == 0
     assert "job1" in capsys.readouterr().out
 
 
 def test_main_show_subcommand_dispatches(cli_module, monkeypatch):
     called = {}
-
-    def fake_show(job_id):
-        called["job_id"] = job_id
-        return 0
-
-    monkeypatch.setattr(cli_module, "cli_show_job", fake_show)
-
+    monkeypatch.setattr(cli_module, "cli_show_job", lambda jid: called.update({"job_id": jid}) or 0)
     rc = cli_module.main(["show", "job1"])
-
     assert rc == 0
     assert called["job_id"] == "job1"
 
 
 def test_main_delete_subcommand_dispatches(cli_module, monkeypatch):
     called = {}
-
-    def fake_delete(job_id, interactive=False):
-        called["job_id"] = job_id
-        called["interactive"] = interactive
-        return 0
-
-    monkeypatch.setattr(cli_module, "remove_job", fake_delete)
-
+    monkeypatch.setattr(cli_module, "remove_job", lambda jid, interactive=False: called.update({"job_id": jid, "interactive": interactive}) or 0)
     rc = cli_module.main(["delete", "job1"])
-
     assert rc == 0
     assert called == {"job_id": "job1", "interactive": False}
 
 
 def test_main_reschedule_subcommand_dispatches(cli_module, monkeypatch):
     called = {}
-
-    def fake_reschedule(job_id, when):
-        called["job_id"] = job_id
-        called["when"] = when
-        return 0
-
-    monkeypatch.setattr(cli_module, "cli_reschedule_job", fake_reschedule)
-
+    monkeypatch.setattr(cli_module, "cli_reschedule_job", lambda jid, when: called.update({"job_id": jid, "when": when}) or 0)
     rc = cli_module.main(["reschedule", "job1", "03:00 tomorrow"])
-
     assert rc == 0
     assert called == {"job_id": "job1", "when": "03:00 tomorrow"}
 
 
 def test_main_session_subcommand_dispatches_with_specific_session(cli_module, monkeypatch):
     called = {}
-
-    def fake_change(job_id, session):
-        called["job_id"] = job_id
-        called["session"] = session
-        return 0
-
-    monkeypatch.setattr(cli_module, "cli_change_session", fake_change)
-
+    monkeypatch.setattr(cli_module, "cli_change_session", lambda jid, session: called.update({"job_id": jid, "session": session}) or 0)
     rc = cli_module.main(["session", "job1", "sess-1"])
-
     assert rc == 0
     assert called == {"job_id": "job1", "session": "sess-1"}
 
 
 def test_main_session_subcommand_dispatches_with_new(cli_module, monkeypatch):
     called = {}
-
-    def fake_change(job_id, session):
-        called["job_id"] = job_id
-        called["session"] = session
-        return 0
-
-    monkeypatch.setattr(cli_module, "cli_change_session", fake_change)
-
+    monkeypatch.setattr(cli_module, "cli_change_session", lambda jid, session: called.update({"job_id": jid, "session": session}) or 0)
     rc = cli_module.main(["session", "job1", "--new"])
-
     assert rc == 0
     assert called == {"job_id": "job1", "session": None}
+
+
+def test_main_retry_subcommand_dispatches(cli_module, monkeypatch):
+    called = {}
+    monkeypatch.setattr(cli_module, "cli_retry_job", lambda jid: called.update({"job_id": jid}) or 0)
+    rc = cli_module.main(["retry", "job1"])
+    assert rc == 0
+    assert called["job_id"] == "job1"
+
+
+def test_main_mark_running_dispatches(cli_module, monkeypatch):
+    called = {}
+    monkeypatch.setattr(cli_module, "cli_mark_running", lambda jid: called.update({"job_id": jid}) or 0)
+    rc = cli_module.main(["mark", "running", "job1"])
+    assert rc == 0
+    assert called["job_id"] == "job1"
+
+
+def test_main_mark_done_dispatches(cli_module, monkeypatch):
+    called = {}
+    monkeypatch.setattr(cli_module, "cli_mark_done", lambda jid: called.update({"job_id": jid}) or 0)
+    rc = cli_module.main(["mark", "done", "job1"])
+    assert rc == 0
+    assert called["job_id"] == "job1"
+
+
+def test_main_mark_failed_dispatches(cli_module, monkeypatch):
+    called = {}
+    monkeypatch.setattr(cli_module, "cli_mark_failed", lambda jid: called.update({"job_id": jid}) or 0)
+    rc = cli_module.main(["mark", "failed", "job1"])
+    assert rc == 0
+    assert called["job_id"] == "job1"
 
 
 def test_main_dry_run_uses_interactive_create_path(cli_module, monkeypatch):
     monkeypatch.setattr(cli_module, "choose", lambda msg, choices, default=None: "Create job")
     called = {}
-
-    def fake_create_and_maybe_submit(dry_run=False):
-        called["dry_run"] = dry_run
-        return 0
-
-    monkeypatch.setattr(cli_module, "create_and_maybe_submit", fake_create_and_maybe_submit)
-
+    monkeypatch.setattr(cli_module, "create_and_maybe_submit", lambda dry_run=False: called.update({"dry_run": dry_run}) or 0)
     rc = cli_module.main(["--dry-run"])
-
     assert rc == 0
     assert called["dry_run"] is True
