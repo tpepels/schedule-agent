@@ -58,13 +58,19 @@ It lets you queue work to run **after limits reset**, so short-lived agent sessi
 
 ## Install
 
-Clone the repository and install it:
+
+Clone the repository and run the install script:
 
 ```bash
 git clone <repo>
 cd schedule-agent
 ./install.sh
 ```
+
+The install script now handles both installation and updates:
+
+- If schedule-agent is not installed, it will perform a fresh install.
+- If schedule-agent is already installed, it will notify you and update to the latest version (via pip if possible, or by reinstalling the local files).
 
 Make sure the install location is on your `PATH`:
 
