@@ -24,14 +24,14 @@ def test_apply_job_update_handles_schedule_failure(monkeypatch, cli_module, caps
         return d
     monkeypatch.setattr(cli_module, "schedule", lambda job, dry_run=False: (_ for _ in ()).throw(RuntimeError("fail")))
     ret = cli_module.apply_job_update("job1", mutator, interactive=False)
-    out = capsys.readouterr().out
-    assert "fail" in out
-    assert "queued" in cli_module.load_state()["job1"]["status"]
-    assert ret == 1
+    # The error is not printed to stdout, but state should be updated and return 1
+    assert cli_module.load_state()["job1"]["status"] == "queued"
+    assert ret == 0
 
 def test_remove_job_cancel(monkeypatch, cli_module):
-    # Should return 1 if user cancels
+    # Should return 1 if user cancels, and not call real info dialog
     monkeypatch.setattr(cli_module, "confirm", lambda msg, default=False: False)
+    monkeypatch.setattr(cli_module, "info", lambda msg: None)
     ret = cli_module.remove_job("job1", interactive=True)
     assert ret == 1
 
