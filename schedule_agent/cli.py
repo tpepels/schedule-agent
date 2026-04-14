@@ -512,6 +512,10 @@ def _format_job_row(job: dict, id_width: int) -> str:
 
     Invalid sentinel jobs (``_invalid=True``) are shown as ``<id>  [!]`` only.
     """
+    STATE_W = 10   # longest display state is "cancelled" (9 chars)
+    AGENT_W = 8    # longest agent name is "claude" (6 chars)
+    SESSION_W = 7  # longest session value is "resume" (6 chars)
+
     job_id = job.get("id", "")
     if job.get("_invalid"):
         return f"{job_id}  [!]"
@@ -522,9 +526,9 @@ def _format_job_row(job: dict, id_width: int) -> str:
 
     row = (
         f"{job_id.ljust(id_width)} "
-        f"{display.ljust(10)} "
-        f"{agent.ljust(8)} "
-        f"{session_mode.ljust(7)}"
+        f"{display.ljust(STATE_W)} "
+        f"{agent.ljust(AGENT_W)} "
+        f"{session_mode.ljust(SESSION_W)}"
     )
 
     dep = job.get("depends_on")
