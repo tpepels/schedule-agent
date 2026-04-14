@@ -1160,6 +1160,28 @@ def test_main_session_subcommand_dispatches_with_new(cli_module, monkeypatch):
     assert called == {"job_id": "job1", "session": None}
 
 
+def test_main_set_session_dispatches(cli_module, monkeypatch):
+    called = {}
+    monkeypatch.setattr(cli_module, "cli_change_session", lambda jid, session: called.update({"job_id": jid, "session": session}) or 0)
+    rc = cli_module.main(["set-session", "job1", "--new"])
+    assert rc == 0
+    assert called == {"job_id": "job1", "session": None}
+
+
+def test_main_session_alias_still_works(cli_module, monkeypatch):
+    called = {}
+    monkeypatch.setattr(cli_module, "cli_change_session", lambda jid, session: called.update({"job_id": jid, "session": session}) or 0)
+    rc = cli_module.main(["session", "job1", "--new"])
+    assert rc == 0
+    assert called == {"job_id": "job1", "session": None}
+
+
+def test_main_set_session_requires_session_or_new(cli_module, monkeypatch):
+    monkeypatch.setattr(cli_module, "cli_change_session", lambda jid, session: 0)
+    with pytest.raises(SystemExit):
+        cli_module.main(["set-session", "job1"])
+
+
 def test_main_retry_subcommand_dispatches(cli_module, monkeypatch):
     called = {}
     monkeypatch.setattr(cli_module, "cli_retry_job", lambda jid: called.update({"job_id": jid}) or 0)

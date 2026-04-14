@@ -1145,10 +1145,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     res_p.add_argument("job_id")
     res_p.add_argument("when", help='New time, e.g. "03:00 tomorrow" or "now + 90 minutes".')
 
-    ses_p = sub.add_parser("session", help="Change session for one job.")
-    ses_p.add_argument("job_id")
-    ses_p.add_argument("session", nargs="?", help="Session id, or omit with --new to clear.")
-    ses_p.add_argument("--new", action="store_true", help='Clear the session and use a new session.')
+    set_ses_p = sub.add_parser("set-session", help="Change session for a job.")
+    set_ses_p.add_argument("job_id")
+    set_ses_p.add_argument("session", nargs="?", help="Session id, or omit with --new to clear.")
+    set_ses_p.add_argument("--new", action="store_true", help='Clear the session and use a new session.')
+
+    ses_alias_p = sub.add_parser("session", help=argparse.SUPPRESS)
+    ses_alias_p.add_argument("job_id")
+    ses_alias_p.add_argument("session", nargs="?")
+    ses_alias_p.add_argument("--new", action="store_true")
 
     retry_p = sub.add_parser("retry", help="Reset a failed job so it can be submitted again.")
     retry_p.add_argument("job_id")
@@ -1187,11 +1192,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             return remove_job(args.job_id, interactive=False)
         if args.command == "reschedule":
             return cli_reschedule_job(args.job_id, args.when)
-        if args.command == "session":
+        if args.command in ("set-session", "session"):
             if args.new:
                 return cli_change_session(args.job_id, None)
             if args.session is None:
-                parser.error("session requires either a session id or --new")
+                parser.error(f"{args.command} requires either a session id or --new")
             return cli_change_session(args.job_id, args.session)
         if args.command == "retry":
             return cli_retry_job(args.job_id)
