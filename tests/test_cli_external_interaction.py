@@ -1105,3 +1105,84 @@ def test_main_dry_run_uses_interactive_create_path(cli_module, monkeypatch):
     rc = cli_module.main(["--dry-run"])
     assert rc == 0
     assert called["dry_run"] is True
+
+
+# ---------------------------------------------------------------------------
+# CLI cancel — cancel without deleting
+# ---------------------------------------------------------------------------
+
+def test_cli_cancel_job_queued(cli_module, capsys):
+    job = _make_new_job(job_id="job1")
+    cli_module.save_jobs([job])
+
+    rc = cli_module.cli_cancel_job("job1")
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "job1: cancelled" in out
+    assert "submission:" in out
+    assert "queued" in out
+    assert "cancelled" in out
+
+    loaded = cli_module.load_jobs()
+    assert len(loaded) == 1
+    assert loaded[0]["submission"] == "cancelled"
+
+
+def test_cli_cancel_job_already_cancelled(cli_module, capsys):
+    from schedule_agent.transitions import on_cancel
+    job = on_cancel(_make_new_job(job_id="job1"))
+    cli_module.save_jobs([job])
+
+    rc = cli_module.cli_cancel_job("job1")
+    assert rc == 1
+
+    out = capsys.readouterr().out
+    assert "error: job job1 cannot be cancelled: already cancelled" in out
+
+
+def test_cli_cancel_job_running(cli_module, capsys):
+    from schedule_agent.transitions import on_submit, on_start
+    job = on_start(on_submit(_make_new_job(job_id="job1"), "42"))
+    cli_module.save_jobs([job])
+
+    rc = cli_module.cli_cancel_job("job1")
+    assert rc == 1
+
+    out = capsys.readouterr().out
+    assert "error: job job1 cannot be cancelled: job is currently running" in out
+
+
+def test_cli_cancel_job_not_found(cli_module, capsys):
+    rc = cli_module.cli_cancel_job("no-such-job")
+    assert rc == 1
+
+    out = capsys.readouterr().out
+    assert "error: job no-such-job not found" in out
+
+
+def test_cli_cancel_job_scheduled(cli_module, capsys, monkeypatch):
+    from schedule_agent.transitions import on_submit
+    job = on_submit(_make_new_job(job_id="job1"), "42")
+    cli_module.save_jobs([job])
+
+    monkeypatch.setattr(cli_module, "cancel_at_job", lambda jid: True)
+
+    rc = cli_module.cli_cancel_job("job1")
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "job1: cancelled" in out
+    assert "scheduled" in out
+    assert "note: at job removed" in out
+
+    loaded = cli_module.load_jobs()
+    assert loaded[0]["submission"] == "cancelled"
+
+
+def test_main_cancel_subcommand_dispatches(cli_module, monkeypatch):
+    called = {}
+    monkeypatch.setattr(cli_module, "cli_cancel_job", lambda jid: called.update({"job_id": jid}) or 0)
+    rc = cli_module.main(["cancel", "job1"])
+    assert rc == 0
+    assert called["job_id"] == "job1"

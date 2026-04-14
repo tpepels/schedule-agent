@@ -997,6 +997,41 @@ def cli_retry_job(job_id: str) -> int:
     return 0
 
 
+def cli_cancel_job(job_id: str) -> int:
+    jobs, idx, job = get_job_and_index(job_id)
+    if job is None:
+        print(f"error: job {job_id} not found")
+        return 1
+    if job["submission"] == "cancelled":
+        print(f"error: job {job_id} cannot be cancelled: already cancelled")
+        return 1
+    if job["submission"] == "running":
+        print(f"error: job {job_id} cannot be cancelled: job is currently running")
+        return 1
+
+    old_submission = job["submission"]
+    at_id = job.get("at_job_id")
+    at_removed = False
+
+    if old_submission == "scheduled":
+        at_removed = cancel_at_job(job_id)
+        # Reload after cancel
+        jobs, idx, job = get_job_and_index(job_id)
+
+    updated = on_cancel(job)
+    jobs[idx] = updated
+    save_jobs(jobs)
+
+    print(f"{job_id}: cancelled")
+    print(f"  submission: {old_submission} \u2192 cancelled")
+    if old_submission == "scheduled":
+        if at_removed:
+            print(f"  note: at job removed")
+        else:
+            print(f"  warning: atrm failed for at job {at_id}")
+    return 0
+
+
 def cli_notify_dependency(job_id: str, parent_result: str) -> int:
     """Apply dependency transition based on parent outcome (success|failed)."""
     jobs, idx, job = get_job_and_index(job_id)
@@ -1087,6 +1122,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     retry_p = sub.add_parser("retry", help="Reset a failed job so it can be submitted again.")
     retry_p.add_argument("job_id")
 
+    cancel_p = sub.add_parser("cancel", help="Cancel a job without deleting it.")
+    cancel_p.add_argument("job_id")
+
     # Automated transition commands (called by the at wrapper script)
     mark_p = sub.add_parser("mark", help="Update job execution state (for at wrapper use).")
     mark_sub = mark_p.add_subparsers(dest="mark_state")
@@ -1123,6 +1161,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cli_change_session(args.job_id, args.session)
         if args.command == "retry":
             return cli_retry_job(args.job_id)
+        if args.command == "cancel":
+            return cli_cancel_job(args.job_id)
         if args.command == "mark":
             if args.mark_state == "running":
                 return cli_mark_running(args.job_id)
