@@ -851,6 +851,21 @@ def test_cli_session_msg_includes_at_job_note_when_was_scheduled(cli_module, cap
     assert "at job removed and resubmitted" in out
 
 
+def test_cli_change_session_warns_when_job_is_running(cli_module, capsys):
+    from schedule_agent.transitions import on_submit, on_start
+    prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
+    job = _make_new_job(job_id="job1", prompt_file=str(prompt_path))
+    job = on_submit(job, "42")
+    job = on_start(job)
+    cli_module.save_jobs([job])
+
+    rc = cli_module.cli_change_session("job1", "sess-new")
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "warning" in out
+    assert "running" in out
+
+
 # ---------------------------------------------------------------------------
 # CLI retry — structured transition messaging
 # ---------------------------------------------------------------------------
@@ -907,6 +922,31 @@ def test_cli_retry_guard_rejects_non_failed_job(cli_module, capsys):
     assert rc == 1
     out = capsys.readouterr().out
     assert "cannot be retried" in out
+
+
+def test_cli_retry_msg_includes_dependency_note_when_job_has_depends_on(cli_module, capsys):
+    from schedule_agent.transitions import make_job, on_submit, on_failure
+    prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
+    job = make_job(
+        job_id="job1",
+        agent="claude",
+        session_mode="new",
+        session_id=None,
+        prompt_file=str(prompt_path),
+        when="03:00 tomorrow",
+        cwd="/tmp/project",
+        log="/tmp/project/log.txt",
+        depends_on="parent-job",
+    )
+    job = on_submit(job, "42")
+    job = on_failure(job)
+    cli_module.save_jobs([job])
+
+    rc = cli_module.cli_retry_job("job1")
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "note: dependency" in out
+    assert "parent-job" in out
 
 
 # ---------------------------------------------------------------------------

@@ -847,19 +847,21 @@ def cli_reschedule_job(job_id: str, new_when: str) -> int:
     old_execution = job["execution"]
     was_scheduled = job.get("submission") == "scheduled"
 
+    print(f"{job_id}: rescheduled")
+    print(f"  when:     {old_when} \u2192 {new_when}")
+
     def mutate(d: dict) -> dict:
         return on_reschedule(d, new_when)
 
     rc = apply_job_update(job_id, mutate, success_message=None, interactive=False)
     if rc == 0:
-        print(f"{job_id}: rescheduled")
-        print(f"  when:     {old_when} \u2192 {new_when}")
         if was_scheduled:
             print("  note: at job removed and resubmitted")
         if old_execution in ("success", "failed"):
             print("  note: execution state reset to pending")
     elif was_scheduled:
-        print(f"  warning: resubmit failed: job left as queued")
+        print("  note: at job removed")
+        print("  warning: resubmit failed: job left as queued")
     return rc
 
 
