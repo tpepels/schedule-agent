@@ -1180,6 +1180,25 @@ def test_cli_cancel_job_scheduled(cli_module, capsys, monkeypatch):
     assert loaded[0]["submission"] == "cancelled"
 
 
+def test_cli_cancel_job_scheduled_atrm_failed(cli_module, capsys, monkeypatch):
+    from schedule_agent.transitions import on_submit
+    job = on_submit(_make_new_job(job_id="job1"), "42")
+    cli_module.save_jobs([job])
+
+    monkeypatch.setattr(cli_module, "cancel_at_job", lambda jid: False)
+
+    rc = cli_module.cli_cancel_job("job1")
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "job1: cancelled" in out
+    assert "warning" in out.lower()
+    assert "atrm failed" in out or "42" in out
+
+    loaded = cli_module.load_jobs()
+    assert loaded[0]["submission"] == "cancelled"
+
+
 def test_main_cancel_subcommand_dispatches(cli_module, monkeypatch):
     called = {}
     monkeypatch.setattr(cli_module, "cli_cancel_job", lambda jid: called.update({"job_id": jid}) or 0)
