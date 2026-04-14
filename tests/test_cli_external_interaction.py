@@ -1355,3 +1355,30 @@ def test_apply_job_update_resubmit_failure_uses_on_resubmit_failed_transition(cl
     saved = next(x for x in loaded if x["id"] == "job-rsf")
     assert saved["submission"] == "queued"
     assert saved["at_job_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# Invalid job sentinel handling
+# ---------------------------------------------------------------------------
+
+def test_cli_show_job_prints_error_for_invalid_job(cli_module, tmp_path, capsys):
+    """cli_show_job prints an error message for _invalid sentinel jobs."""
+    invalid_job = {"id": "bad-job", "_invalid": True, "_error": "Invariant 1: ..."}
+    cli_module.save_jobs([invalid_job])
+
+    rc = cli_module.cli_show_job("bad-job")
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "inconsistent state" in out
+    assert "schedule-agent delete bad-job" in out
+
+
+def test_list_shows_invalid_job_with_marker(cli_module, tmp_path, capsys):
+    """list output marks invalid jobs with [!]."""
+    invalid_job = {"id": "bad-job", "_invalid": True, "_error": "some error"}
+    cli_module.save_jobs([invalid_job])
+
+    output = cli_module.list_jobs_noninteractive()
+    assert "[!]" in output
+    assert "bad-job" in output

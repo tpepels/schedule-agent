@@ -5,6 +5,8 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+from .state_model import check_invariants
+
 
 APP_NAME = "schedule-agent"
 
@@ -124,7 +126,16 @@ def load_jobs() -> list[dict]:
         except Exception:
             pass
 
-    return [migrate_job(j, legacy.get(j.get("id"))) for j in raw]
+    results = []
+    for j in raw:
+        try:
+            migrated = migrate_job(j, legacy.get(j.get("id")))
+            check_invariants(migrated)
+            results.append(migrated)
+        except Exception as e:
+            job_id = j.get("id", "<unknown>")
+            results.append({"id": job_id, "_invalid": True, "_error": str(e)})
+    return results
 
 
 def save_jobs(jobs: list[dict]) -> None:

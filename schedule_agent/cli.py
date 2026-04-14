@@ -418,10 +418,11 @@ def cancel_at_job(job_id: str) -> bool:
     legacy[job_id] = entry
     save_state(legacy)
 
-    # Update job record
+    # Update job record: move back to queued so no invariant is violated
     if job is not None:
         updated = dict(job)
         updated["at_job_id"] = None
+        updated["submission"] = "queued"
         updated["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         save_jobs(update_job_in_list(jobs, updated))
 
@@ -807,6 +808,11 @@ def cli_show_job(job_id: str) -> int:
     _, _, job = get_job_and_index(job_id)
     if job is None:
         print("No such job.")
+        return 1
+    if job.get("_invalid"):
+        print(f"error: job {job_id} has inconsistent state")
+        print(f"  {job['_error']}")
+        print(f"  use `schedule-agent delete {job_id}` to remove it")
         return 1
     print(show_job_text(job))
     return 0

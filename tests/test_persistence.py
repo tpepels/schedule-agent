@@ -188,3 +188,52 @@ def test_write_prompt_file(tmp_path):
     path = persistence.write_prompt_file(prompt_dir, "job1", "Hello prompt")
     assert Path(path).read_text(encoding="utf-8") == "Hello prompt"
     assert Path(path).name == "job1.md"
+
+
+# ---------------------------------------------------------------------------
+# load_jobs – invalid record isolation
+# ---------------------------------------------------------------------------
+
+def test_load_jobs_isolates_invalid_records(tmp_path, monkeypatch):
+    """A corrupt job record produces a sentinel instead of crashing load_jobs."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+
+    from schedule_agent import persistence
+    from schedule_agent.transitions import make_job
+
+    good_job = make_job("good", "claude", "new", None, "/tmp/p.md", "now", "/tmp", "/tmp/log.txt")
+    # Bad job: submission=scheduled but no at_job_id (violates invariant 1)
+    bad_job = {
+        "id": "bad",
+        "submission": "scheduled",  # requires at_job_id
+        "at_job_id": None,           # invariant violation
+        "execution": "pending",
+        "readiness": "ready",
+        "session_mode": "new",
+        "session_id": None,
+        "agent": "claude",
+        "when": "now",
+        "cwd": "/tmp",
+        "log": "/tmp/log.txt",
+        "prompt_file": "/tmp/p.md",
+        "created_at": "2026-01-01 00:00:00",
+        "updated_at": "2026-01-01 00:00:00",
+        "last_run_at": None,
+    }
+
+    import json
+    queue_file = persistence._queue_file()
+    queue_file.parent.mkdir(parents=True, exist_ok=True)
+    queue_file.write_text(
+        json.dumps(good_job) + "\n" + json.dumps(bad_job),
+        encoding="utf-8"
+    )
+
+    jobs = persistence.load_jobs()
+    assert len(jobs) == 2
+    assert jobs[0]["id"] == "good"
+    assert jobs[0].get("_invalid") is None
+    assert jobs[1]["id"] == "bad"
+    assert jobs[1].get("_invalid") is True
+    assert "_error" in jobs[1]
