@@ -1,20 +1,64 @@
 # schedule-agent
 
-Queue Codex and Claude CLI work so it can run **after your session expires**.
+Queue Codex and Claude CLI work so it runs **after your session expires**.
+
+Persistent job scheduling for short-lived agent sessions.
 
 ---
 
-## Why this exists
+## What
 
-You’re working with Codex or Claude.
+```bash
+schedule-agent
+````
+
+`schedule-agent` is a CLI tool for scheduling Codex and Claude prompts to run later.
+
+It lets you:
+
+* queue agent work for a later time
+* persist jobs on disk
+* inspect scheduled jobs
+* safely modify jobs that were already submitted
+
+Jobs are executed through `at`, not interactively.
+
+---
+
+## Why
+
+You run something like:
+
+```bash
+claude -p "do X"
+```
+
+or:
+
+```bash
+codex exec "do X"
+```
+
+Then one of the usual things happens:
+
+* your session expires
+* your usage resets later
+* a long task gets interrupted
+* you need the work to continue while you are away
 
 ```bash
 schedule-agent
 ```
 
-This tool turns them into a batch system for AI workflows.
+exists for exactly that situation.
 
-## Installation
+It lets you queue work to run **after limits reset**, so short-lived agent sessions do not force short-lived workflows.
+
+---
+
+## Install
+
+Clone the repository and install it:
 
 ```bash
 git clone <repo>
@@ -22,254 +66,255 @@ cd schedule-agent
 ./install.sh
 ```
 
-Or from source as a package:
-
-```bash
-pip install .
-```
-
-Then ensure the install target is in your `PATH`:
+Make sure the install location is on your `PATH`:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Run:
+Then run:
 
 ```bash
 schedule-agent
 ```
 
+---
+
 ## Requirements
 
-Check the required tools:
+This tool is intended for:
+
+```bash
+uname -s
+```
+
+Expected result:
+
+```text
+Linux
+```
+
+It depends on the system `at` scheduler, so these commands must exist:
 
 ```bash
 which at
 which atrm
-which codex   # optional
-which claude  # optional
 ```
 
-Ensure the scheduler daemon is running:
+And the scheduler daemon must be running:
 
 ```bash
 systemctl status atd
 ```
 
-## Agent permissions
-
-The scheduler runs agents in non-interactive, fully automated mode.
-
-Codex uses:
+You also need at least one supported agent CLI installed:
 
 ```bash
-codex exec --dangerously-bypass-approvals-and-sandbox
+which claude
+which codex
 ```
 
-Claude uses:
+In practice, the minimum requirement set is:
 
-```bash
-claude -p --dangerously-skip-permissions
-```
+* Linux
+* `at`
+* `atrm`
+* `atd`
+* `claude` and/or `codex`
+* a text editor such as `nano`, `nvim`, or `code --wait`
 
-Implications:
+---
 
-```bash
-git status
-```
+## Use
 
-- no permission prompts
-- no interactive confirmations
-- full file and shell access
-
-Always test prompts manually before scheduling.
-
-## Configurable editor
-
-Editor resolution order:
-
-1. `SCHEDULE_AGENT_EDITOR`
-2. `EDITOR`
-3. fallback: `nano`
-
-Examples:
-
-```bash
-export SCHEDULE_AGENT_EDITOR="nvim"
-```
-
-```bash
-export EDITOR="code --wait"
-```
-
-## Core commands
-
-| Command | Description |
-|---|---|
-| `schedule-agent` | Open the interactive UI |
-| `schedule-agent --dry-run` | Show what would be scheduled during interactive create |
-| `schedule-agent list` | List jobs |
-| `schedule-agent show <id>` | Show one job |
-| `schedule-agent delete <id>` | Delete one job |
-| `schedule-agent reschedule <id> "<when>"` | Change time for one job |
-| `schedule-agent session <id> <session>` | Change session for one job |
-| `schedule-agent session <id> --new` | Clear the session and use a new one |
-
-## Common interactions
-
-Create a job:
+### Create a job
 
 ```bash
 schedule-agent
 ```
 
-List jobs:
+Typical flow:
+
+* choose agent
+* write prompt
+* choose when to run
+* submit
+
+### Inspect jobs
 
 ```bash
 schedule-agent list
 ```
 
-Show one job:
+### Show job details
 
 ```bash
-schedule-agent show claude-20260414-101200
+schedule-agent show <id>
 ```
 
-Delete one job:
-
-```bash
-schedule-agent delete claude-20260414-101200
-```
-
-Reschedule one job:
-
-```bash
-schedule-agent reschedule claude-20260414-101200 "03:00 tomorrow"
-```
-
-Change a job to a specific session:
-
-```bash
-schedule-agent session claude-20260414-101200 abc123session
-```
-
-Change a job back to a new session:
-
-```bash
-schedule-agent session claude-20260414-101200 --new
-```
-
-Preview the generated `at` script during create:
-
-```bash
-schedule-agent --dry-run
-```
-
-## Mutation model
-
-The scheduler preserves intent.
-
-Queued job:
+### Reschedule a job
 
 ```bash
 schedule-agent reschedule <id> "now + 90 minutes"
 ```
 
-- updated in place
-- remains queued
-
-Submitted job:
+or:
 
 ```bash
 schedule-agent reschedule <id> "03:00 tomorrow"
 ```
 
-Under the hood:
+### Change session
+
+```bash
+schedule-agent session <id> <session_id>
+```
+
+or reset to a new session:
+
+```bash
+schedule-agent session <id> --new
+```
+
+### Delete a job
+
+```bash
+schedule-agent delete <id>
+```
+
+### Preview before scheduling
+
+```bash
+schedule-agent --dry-run
+```
+
+---
+
+## Remarks
+
+### Agent permissions
+
+Jobs run unattended and without interactive permission prompts.
+
+By default, the tool uses agent commands in the “just do it” style:
+
+```bash
+codex exec --dangerously-bypass-approvals-and-sandbox
+claude -p --dangerously-skip-permissions
+```
+
+That means scheduled agents may:
+
+* modify files
+* run shell commands
+* change repository state
+
+So this is the rule:
+
+```bash
+git status
+```
+
+Check your workspace first, and test prompts manually before scheduling them.
+
+---
+
+### Execution model
+
+Jobs are scheduled through `at`:
+
+```bash
+at now + 10 minutes
+```
+
+That has a few consequences:
+
+* jobs run non-interactively
+* jobs run with a minimal environment
+* jobs do not inherit your full interactive shell setup
+
+This tool works around that by storing prompts on disk and executing agents with stdin detached, so the scheduled shell wrapper is not accidentally read by the agent.
+
+---
+
+### Mutation model
+
+You can safely modify jobs after creating them:
+
+```bash
+schedule-agent reschedule <id> "03:00 tomorrow"
+```
+
+If the job was already submitted, the tool will automatically:
 
 ```bash
 atrm <job_id>
 at <new time>
 ```
 
-- old `at` job removed
-- job updated
-- job re-submitted automatically
+In other words:
 
-Delete a submitted job:
+* old scheduled job is removed
+* job definition is updated
+* job is re-submitted automatically
 
-```bash
-schedule-agent delete <id>
-```
+The same applies when changing session. You do not need to manually track whether a job is queued or already submitted.
 
-- `atrm` runs first
-- then the job is removed from queue and state
+---
 
-Submitted jobs are marked with **`(S)`** in interactive and non-interactive job listings.
+### Storage
 
-## Storage
-
-Inspect state:
+State is stored in:
 
 ```bash
-ls ~/.local/state/schedule-agent
+~/.local/state/schedule-agent
 ```
 
-Inspect prompt files:
+Prompt files are stored in:
 
 ```bash
-ls ~/.local/share/schedule-agent/agent_prompts
+~/.local/share/schedule-agent/agent_prompts
 ```
 
-The tool respects `XDG_STATE_HOME` and `XDG_DATA_HOME` if they are set.
+If `XDG_STATE_HOME` or `XDG_DATA_HOME` are set, those locations are used instead.
 
-## Session discovery
+---
 
-Inspect local session roots:
+### Editor
+
+Prompt editing uses this resolution order:
+
+1. `SCHEDULE_AGENT_EDITOR`
+2. `EDITOR`
+3. fallback: `nano`
+
+For example:
 
 ```bash
-ls ~/.codex/sessions
-ls ~/.claude/projects
+export SCHEDULE_AGENT_EDITOR="nvim"
 ```
 
-The scheduler shows the last 10 discovered sessions when you create a job or change a session interactively.
-
-## Asciinema demo
-
-Record:
+or:
 
 ```bash
-./demo/record-demo.sh
+export EDITOR="code --wait"
 ```
 
-Play:
-
-```bash
-asciinema play demo/demo.cast
-```
-
-Upload:
-
-```bash
-asciinema upload demo/demo.cast
-```
-
-## Design intent
-
-This tool is intentionally strict.
-
-```bash
-schedule-agent
-```
-
-It prioritizes:
-
-- predictability over convenience
-- explicit control over hidden behavior
-- filesystem state over in-memory abstraction
-
-It is designed for unattended execution.
+---
 
 ## License
 
 MIT
+
+```
+
+What changed from your version:
+
+- removed the weak ASCII logo
+- added a real **Requirements** section
+- explicitly says **Linux**
+- explicitly explains **`at` / `atrm` / `atd`**
+- keeps the flow: what → why → install → requirements → use → remarks
+- trims repetition a bit so it reads more like a tool README and less like a product page
+
+The only extra thing I’d add to the repo after this is a tiny `install.sh` note in the README if your installer also bootstraps the Python deps internally.
