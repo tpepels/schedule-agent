@@ -35,6 +35,7 @@ from .state_model import (
     can_change_session,
     can_delete,
     can_reschedule,
+    can_retry,
     can_submit,
     derive_display_state,
 )
@@ -843,11 +844,23 @@ def cli_reschedule_job(job_id: str, new_when: str) -> int:
         print("No such job.")
         return 1
     old_when = job["when"]
+    old_execution = job["execution"]
+    was_scheduled = job.get("submission") == "scheduled"
 
     def mutate(d: dict) -> dict:
         return on_reschedule(d, new_when)
 
-    return apply_job_update(job_id, mutate, success_message=f"Rescheduled {job_id} from {old_when} to {new_when}.", interactive=False)
+    rc = apply_job_update(job_id, mutate, success_message=None, interactive=False)
+    if rc == 0:
+        print(f"{job_id}: rescheduled")
+        print(f"  when:     {old_when} \u2192 {new_when}")
+        if was_scheduled:
+            print("  note: at job removed and resubmitted")
+        if old_execution in ("success", "failed"):
+            print("  note: execution state reset to pending")
+    elif was_scheduled:
+        print(f"  warning: resubmit failed: job left as queued")
+    return rc
 
 
 def change_session(job_id: str, interactive: bool = True) -> int:
@@ -876,12 +889,26 @@ def cli_change_session(job_id: str, session: str | None) -> int:
     if job is None:
         print("No such job.")
         return 1
+    old_mode = job.get("session_mode", "new")
+    old_session_id = job.get("session_id")
+    was_scheduled = job.get("submission") == "scheduled"
+    was_running = job.get("submission") == "running"
     session_mode = "resume" if session else "new"
 
     def mutate(d: dict) -> dict:
         return on_change_session(d, session_mode, session)
 
-    return apply_job_update(job_id, mutate, success_message=f"Changed session for {job_id} to {session or 'new'}.", interactive=False)
+    rc = apply_job_update(job_id, mutate, success_message=None, interactive=False)
+    if rc == 0:
+        old_label = old_mode if not old_session_id else f"{old_mode}:{old_session_id[:8]}"
+        new_label = session_mode if not session else f"{session_mode}:{session[:8]}"
+        print(f"{job_id}: session updated")
+        print(f"  session:  {old_label} \u2192 {new_label}")
+        if was_scheduled:
+            print("  note: at job removed and resubmitted")
+        if was_running:
+            print("  warning: job is currently running; session change takes effect on next run")
+    return rc
 
 
 def remove_job(job_id: str, interactive: bool = True) -> int:
@@ -889,7 +916,25 @@ def remove_job(job_id: str, interactive: bool = True) -> int:
         if not confirm(f"Delete {job_id}?", default=False):
             info("Cancelled.")
             return 1
-    return apply_job_update(job_id, lambda d: None, success_message="Deleted.", interactive=interactive)
+        return apply_job_update(job_id, lambda d: None, success_message="Deleted.", interactive=interactive)
+    # Non-interactive: capture pre-deletion state for structured output
+    _, _, job = get_job_and_index(job_id)
+    if job is None:
+        print("No such job.")
+        return 1
+    was_scheduled = job.get("submission") == "scheduled"
+    # Find dependent jobs before deletion
+    all_jobs = load_jobs()
+    dependent_ids = [j["id"] for j in all_jobs if j.get("depends_on") == job_id]
+    rc = apply_job_update(job_id, lambda d: None, success_message=None, interactive=False)
+    if rc == 0:
+        print(f"{job_id}: deleted")
+        if was_scheduled:
+            print("  note: at job removed")
+        if dependent_ids:
+            ids_str = ", ".join(dependent_ids)
+            print(f"  warning: dependent jobs [{ids_str}] remain in their current state")
+    return rc
 
 
 # ---------------------------------------------------------------------------
@@ -934,9 +979,19 @@ def cli_retry_job(job_id: str) -> int:
     if job is None:
         print(f"No such job: {job_id}")
         return 1
+    if not can_retry(job):
+        print(f"error: job {job_id} cannot be retried\n  current execution state: {job['execution']} (retry requires: failed)")
+        return 1
+    old_execution = job["execution"]
+    old_readiness = job["readiness"]
     updated = on_retry(job)
     jobs[idx] = updated
     save_jobs(jobs)
+    print(f"{job_id}: reset for retry")
+    print(f"  execution: {old_execution} \u2192 pending")
+    print(f"  readiness: {old_readiness} \u2192 ready")
+    if job.get("depends_on"):
+        print(f"  note: dependency {job['depends_on']} has not resolved; readiness forced to ready")
     return 0
 
 

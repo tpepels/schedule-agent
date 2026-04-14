@@ -713,7 +713,7 @@ def test_cli_show_job_returns_one_for_missing_job(cli_module, capsys):
 
 
 # ---------------------------------------------------------------------------
-# CLI reschedule
+# CLI reschedule — structured transition messaging
 # ---------------------------------------------------------------------------
 
 def test_cli_reschedule_job_updates_time(cli_module, capsys):
@@ -724,11 +724,70 @@ def test_cli_reschedule_job_updates_time(cli_module, capsys):
     rc = cli_module.cli_reschedule_job("job1", "03:00 tomorrow")
     assert rc == 0
     assert cli_module.load_jobs()[0]["when"] == "03:00 tomorrow"
-    assert "Rescheduled job1 from now + 5 minutes to 03:00 tomorrow." in capsys.readouterr().out
+
+
+def test_cli_reschedule_msg_contains_rescheduled_header(cli_module, capsys):
+    prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
+    job = _make_new_job(job_id="job1", when="now + 5 minutes", prompt_file=str(prompt_path))
+    cli_module.save_jobs([job])
+
+    cli_module.cli_reschedule_job("job1", "03:00 tomorrow")
+    out = capsys.readouterr().out
+    assert "job1: rescheduled" in out
+
+
+def test_cli_reschedule_msg_contains_when_line_with_old_and_new_time(cli_module, capsys):
+    prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
+    job = _make_new_job(job_id="job1", when="now + 5 minutes", prompt_file=str(prompt_path))
+    cli_module.save_jobs([job])
+
+    cli_module.cli_reschedule_job("job1", "03:00 tomorrow")
+    out = capsys.readouterr().out
+    assert "when:" in out
+    assert "now + 5 minutes" in out
+    assert "03:00 tomorrow" in out
+
+
+def test_cli_reschedule_msg_includes_execution_reset_note_when_job_was_failed(cli_module, capsys):
+    from schedule_agent.transitions import on_failure, on_submit
+    prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
+    job = _make_new_job(job_id="job1", when="now + 5 minutes", prompt_file=str(prompt_path))
+    job = on_submit(job, "42")
+    job = on_failure(job)
+    cli_module.save_jobs([job])
+
+    cli_module.cli_reschedule_job("job1", "03:00 tomorrow")
+    out = capsys.readouterr().out
+    assert "execution state reset to pending" in out
+
+
+def test_cli_reschedule_msg_no_execution_reset_note_for_pending_job(cli_module, capsys):
+    prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
+    job = _make_new_job(job_id="job1", when="now + 5 minutes", prompt_file=str(prompt_path))
+    cli_module.save_jobs([job])
+
+    cli_module.cli_reschedule_job("job1", "03:00 tomorrow")
+    out = capsys.readouterr().out
+    assert "execution state reset to pending" not in out
+
+
+def test_cli_reschedule_msg_includes_at_job_note_when_was_scheduled(cli_module, capsys, monkeypatch):
+    from schedule_agent.transitions import on_submit
+    prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
+    job = _make_new_job(job_id="job1", when="now + 5 minutes", prompt_file=str(prompt_path))
+    job = on_submit(job, "42")
+    cli_module.save_jobs([job])
+
+    monkeypatch.setattr(cli_module, "cancel_at_job", lambda jid: True)
+    monkeypatch.setattr(cli_module, "schedule", lambda j, dry_run=False: "job 99 at Tue Apr 14")
+
+    cli_module.cli_reschedule_job("job1", "03:00 tomorrow")
+    out = capsys.readouterr().out
+    assert "at job removed and resubmitted" in out
 
 
 # ---------------------------------------------------------------------------
-# CLI change session
+# CLI change session — structured transition messaging
 # ---------------------------------------------------------------------------
 
 def test_cli_change_session_sets_specific_session(cli_module, capsys):
@@ -741,7 +800,6 @@ def test_cli_change_session_sets_specific_session(cli_module, capsys):
     loaded = cli_module.load_jobs()[0]
     assert loaded["session_id"] == "sess-abc"
     assert loaded["session_mode"] == "resume"
-    assert "Changed session for job1 to sess-abc." in capsys.readouterr().out
 
 
 def test_cli_change_session_can_clear_to_new(cli_module, capsys):
@@ -754,11 +812,105 @@ def test_cli_change_session_can_clear_to_new(cli_module, capsys):
     loaded = cli_module.load_jobs()[0]
     assert loaded["session_id"] is None
     assert loaded["session_mode"] == "new"
-    assert "Changed session for job1 to new." in capsys.readouterr().out
+
+
+def test_cli_session_msg_contains_session_updated_header(cli_module, capsys):
+    prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
+    job = _make_new_job(job_id="job1", prompt_file=str(prompt_path))
+    cli_module.save_jobs([job])
+
+    cli_module.cli_change_session("job1", "sess-abc")
+    out = capsys.readouterr().out
+    assert "job1: session updated" in out
+
+
+def test_cli_session_msg_contains_session_line(cli_module, capsys):
+    prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
+    job = _make_new_job(job_id="job1", prompt_file=str(prompt_path))
+    cli_module.save_jobs([job])
+
+    cli_module.cli_change_session("job1", "sess-abcdefgh-long")
+    out = capsys.readouterr().out
+    assert "session:" in out
+    # new session id truncated to 8 chars
+    assert "sess-abc" in out
+
+
+def test_cli_session_msg_includes_at_job_note_when_was_scheduled(cli_module, capsys, monkeypatch):
+    from schedule_agent.transitions import on_submit
+    prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
+    job = _make_new_job(job_id="job1", prompt_file=str(prompt_path))
+    job = on_submit(job, "42")
+    cli_module.save_jobs([job])
+
+    monkeypatch.setattr(cli_module, "cancel_at_job", lambda jid: True)
+    monkeypatch.setattr(cli_module, "schedule", lambda j, dry_run=False: "job 99 at Tue Apr 14")
+
+    cli_module.cli_change_session("job1", "sess-new")
+    out = capsys.readouterr().out
+    assert "at job removed and resubmitted" in out
 
 
 # ---------------------------------------------------------------------------
-# remove_job non-interactive
+# CLI retry — structured transition messaging
+# ---------------------------------------------------------------------------
+
+def test_cli_retry_msg_contains_reset_for_retry_header(cli_module, capsys):
+    from schedule_agent.transitions import on_failure, on_submit
+    prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
+    job = _make_new_job(job_id="job1", prompt_file=str(prompt_path))
+    job = on_submit(job, "42")
+    job = on_failure(job)
+    cli_module.save_jobs([job])
+
+    rc = cli_module.cli_retry_job("job1")
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "job1: reset for retry" in out
+
+
+def test_cli_retry_msg_contains_execution_line(cli_module, capsys):
+    from schedule_agent.transitions import on_failure, on_submit
+    prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
+    job = _make_new_job(job_id="job1", prompt_file=str(prompt_path))
+    job = on_submit(job, "42")
+    job = on_failure(job)
+    cli_module.save_jobs([job])
+
+    cli_module.cli_retry_job("job1")
+    out = capsys.readouterr().out
+    assert "execution:" in out
+    assert "failed" in out
+    assert "pending" in out
+
+
+def test_cli_retry_msg_contains_readiness_line(cli_module, capsys):
+    from schedule_agent.transitions import on_failure, on_submit
+    prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
+    job = _make_new_job(job_id="job1", prompt_file=str(prompt_path))
+    job = on_submit(job, "42")
+    job = on_failure(job)
+    cli_module.save_jobs([job])
+
+    cli_module.cli_retry_job("job1")
+    out = capsys.readouterr().out
+    assert "readiness:" in out
+    assert "ready" in out
+
+
+def test_cli_retry_guard_rejects_non_failed_job(cli_module, capsys):
+    prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
+    job = _make_new_job(job_id="job1", prompt_file=str(prompt_path))
+    cli_module.save_jobs([job])
+
+    rc = cli_module.cli_retry_job("job1")
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "cannot be retried" in out
+
+
+# ---------------------------------------------------------------------------
+# remove_job non-interactive — structured transition messaging
 # ---------------------------------------------------------------------------
 
 def test_remove_job_noninteractive_deletes_without_prompt(cli_module, capsys):
@@ -770,7 +922,55 @@ def test_remove_job_noninteractive_deletes_without_prompt(cli_module, capsys):
     assert rc == 0
     assert cli_module.load_jobs() == []
     assert not prompt_path.exists()
-    assert "Deleted." in capsys.readouterr().out
+
+
+def test_remove_job_msg_contains_deleted_header(cli_module, capsys):
+    prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
+    job = _make_new_job(job_id="job1", prompt_file=str(prompt_path))
+    cli_module.save_jobs([job])
+
+    cli_module.remove_job("job1", interactive=False)
+    out = capsys.readouterr().out
+    assert "job1: deleted" in out
+
+
+def test_remove_job_msg_includes_at_job_note_when_was_scheduled(cli_module, capsys, monkeypatch):
+    from schedule_agent.transitions import on_submit
+    prompt_path = Path(cli_module.write_prompt_file("job1", "prompt"))
+    job = _make_new_job(job_id="job1", prompt_file=str(prompt_path))
+    job = on_submit(job, "42")
+    cli_module.save_jobs([job])
+
+    monkeypatch.setattr(cli_module, "cancel_at_job", lambda jid: True)
+
+    cli_module.remove_job("job1", interactive=False)
+    out = capsys.readouterr().out
+    assert "at job removed" in out
+
+
+def test_remove_job_msg_warns_about_dependent_jobs(cli_module, capsys):
+    from schedule_agent.transitions import make_job
+    prompt_path_1 = Path(cli_module.write_prompt_file("job1", "prompt"))
+    prompt_path_2 = Path(cli_module.write_prompt_file("job2", "prompt"))
+    job1 = _make_new_job(job_id="job1", prompt_file=str(prompt_path_1))
+    job2 = make_job(
+        job_id="job2",
+        agent="claude",
+        session_mode="new",
+        session_id=None,
+        prompt_file=str(prompt_path_2),
+        when="03:00 tomorrow",
+        cwd="/tmp/project",
+        log="/tmp/project/log.txt",
+    )
+    job2 = dict(job2)
+    job2["depends_on"] = "job1"
+    cli_module.save_jobs([job1, job2])
+
+    cli_module.remove_job("job1", interactive=False)
+    out = capsys.readouterr().out
+    assert "dependent jobs" in out
+    assert "job2" in out
 
 
 # ---------------------------------------------------------------------------
