@@ -733,14 +733,15 @@ def show_job_text(job: dict) -> str:
 
     w = 15  # column label width (key + colon, left-aligned, values start at col 16)
     lbl = lambda key: f"{key}:".ljust(w)
+    indented_label_w = w - 2  # account for 2-space indent prefix
 
     lines = [
         f"{lbl('id')}{job['id']}",
         f"{lbl('display')}{display}",
-        f"  {'submission:'.ljust(13)}{job['submission']}",
-        f"  {'execution:'.ljust(13)}{job['execution']}",
-        f"  {'readiness:'.ljust(13)}{job['readiness']}",
-        f"  {'session:'.ljust(13)}{job['session_mode']}",
+        f"  {'submission:'.ljust(indented_label_w)}{job['submission']}",
+        f"  {'execution:'.ljust(indented_label_w)}{job['execution']}",
+        f"  {'readiness:'.ljust(indented_label_w)}{job['readiness']}",
+        f"  {'session:'.ljust(indented_label_w)}{job['session_mode']}",
         f"{lbl('agent')}{job['agent']}",
         f"{lbl('when')}{job['when']}",
         f"{lbl('at_job_id')}{at_job_id_val}",
