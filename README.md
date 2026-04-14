@@ -1,42 +1,18 @@
 # schedule-agent
 
-A terminal UI for scheduling Codex and Claude CLI jobs using `at`, with safe mutation of already scheduled work.
+Queue Codex and Claude CLI work so it can run **after your session expires**.
+
+---
 
 ## Why this exists
 
-Agent CLIs are powerful but time-bound and rate-limited. `schedule-agent` lets you queue work for off-hours, keep it inspectable on disk, and safely edit jobs that are already scheduled.
+You’re working with Codex or Claude.
 
-## Features
+```bash
+schedule-agent
+```
 
-- schedule jobs for **Codex** or **Claude**
-- start a **new session** or attach to one of the last 10 discovered local sessions
-- schedule work:
-  - by offset from now
-  - today at a specific time
-  - tomorrow at a specific time
-- interactive jobs list with keyboard actions
-- safe mutation of already submitted jobs:
-  - reschedule
-  - change session
-  - delete
-- real `at` cancellation via `atrm`
-- prompt files stored on disk instead of inlining huge shell-quoted blobs
-
-Submitted jobs are marked with **`(S)`** in the jobs list.
-
-## Requirements
-
-You need:
-
-- Python 3.10+
-- `at`
-- `atrm`
-- a text editor available in your environment
-- one or both of:
-  - `codex`
-  - `claude`
-
-Also ensure the `atd` service is running.
+This tool turns them into a batch system for AI workflows.
 
 ## Installation
 
@@ -46,23 +22,72 @@ cd schedule-agent
 ./install.sh
 ```
 
-After installation:
+Or from source as a package:
+
+```bash
+pip install .
+```
+
+Then ensure the install target is in your `PATH`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Run:
 
 ```bash
 schedule-agent
 ```
 
-Uninstall the scheduler using:
+## Requirements
+
+Check the required tools:
 
 ```bash
-./uninstall.sh
+which at
+which atrm
+which codex   # optional
+which claude  # optional
 ```
+
+Ensure the scheduler daemon is running:
+
+```bash
+systemctl status atd
+```
+
+## Agent permissions
+
+The scheduler runs agents in non-interactive, fully automated mode.
+
+Codex uses:
+
+```bash
+codex exec --dangerously-bypass-approvals-and-sandbox
+```
+
+Claude uses:
+
+```bash
+claude -p --dangerously-skip-permissions
+```
+
+Implications:
+
+```bash
+git status
+```
+
+- no permission prompts
+- no interactive confirmations
+- full file and shell access
+
+Always test prompts manually before scheduling.
 
 ## Configurable editor
 
-Prompt editing is not hardcoded to `nano` anymore.
-
-The tool resolves the editor in this order:
+Editor resolution order:
 
 1. `SCHEDULE_AGENT_EDITOR`
 2. `EDITOR`
@@ -78,135 +103,172 @@ export SCHEDULE_AGENT_EDITOR="nvim"
 export EDITOR="code --wait"
 ```
 
-The editor command is parsed with shell-style splitting, so values like `code --wait` work correctly.
+## Core commands
 
-## Safety and execution model
+| Command | Description |
+|---|---|
+| `schedule-agent` | Open the interactive UI |
+| `schedule-agent --dry-run` | Show what would be scheduled during interactive create |
+| `schedule-agent list` | List jobs |
+| `schedule-agent show <id>` | Show one job |
+| `schedule-agent delete <id>` | Delete one job |
+| `schedule-agent reschedule <id> "<when>"` | Change time for one job |
+| `schedule-agent session <id> <session>` | Change session for one job |
+| `schedule-agent session <id> --new` | Clear the session and use a new one |
 
-Jobs are scheduled through the system `at` daemon.
+## Common interactions
 
-That means jobs run:
-
-- non-interactively
-- with a minimal environment
-- without your interactive shell startup files
-
-### Prompt handling
-
-Prompts are written to dedicated files under the tool’s data directory.
-
-Scheduled agent commands read prompt text from disk and run with:
+Create a job:
 
 ```bash
-</dev/null
+schedule-agent
 ```
 
-This is intentional. It prevents the agent from accidentally reading the `at` wrapper script from stdin.
+List jobs:
 
-## Storage locations
-
-The tool is installable and uses XDG-style paths rather than hardcoded script-relative files.
-
-### State
-
-By default:
-
-```text
-~/.local/state/schedule-agent/
+```bash
+schedule-agent list
 ```
 
-Contains:
+Show one job:
 
-- queue file
-- job state
-
-### Data
-
-By default:
-
-```text
-~/.local/share/schedule-agent/
+```bash
+schedule-agent show claude-20260414-101200
 ```
 
-Contains:
+Delete one job:
 
-- generated prompt files
+```bash
+schedule-agent delete claude-20260414-101200
+```
 
-If `XDG_STATE_HOME` or `XDG_DATA_HOME` are set, those are respected.
+Reschedule one job:
 
-## Session discovery
+```bash
+schedule-agent reschedule claude-20260414-101200 "03:00 tomorrow"
+```
 
-Session selection is explicit. The tool does not guess “most recent” automatically.
+Change a job to a specific session:
 
-It discovers the last 10 local sessions from:
+```bash
+schedule-agent session claude-20260414-101200 abc123session
+```
 
-- Codex:
-  - `~/.codex/sessions`
-- Claude:
-  - `~/.claude/projects`
+Change a job back to a new session:
 
-## Controls
+```bash
+schedule-agent session claude-20260414-101200 --new
+```
 
-Top-level menu:
+Preview the generated `at` script during create:
 
-- **Create job**
-- **Jobs**
+```bash
+schedule-agent --dry-run
+```
 
-Jobs view keys:
-
-- **Enter** → view job
-- **R** → reschedule
-- **D** → delete
-- **C** → change session
-- **Q / Esc** → quit
-- **Up / Down** or **K / J** → move
-
-## Mutation rules
+## Mutation model
 
 The scheduler preserves intent.
 
-### If a job is queued
-
-Mutating it updates the job and leaves it queued.
-
-### If a job is submitted
-
-Mutating it will:
-
-1. cancel the old `at` job with `atrm`
-2. update the job
-3. re-submit it automatically
-
-Deleting a submitted job also removes its queued `at` job first.
-
-This behavior is centralized, not implemented case by case.
-
-## CLI assumptions
-
-The default command templates are:
-
-### Codex
+Queued job:
 
 ```bash
-codex exec ...
-codex exec resume <session> ...
+schedule-agent reschedule <id> "now + 90 minutes"
 ```
 
-### Claude
+- updated in place
+- remains queued
+
+Submitted job:
 
 ```bash
-claude -p ...
-claude --resume <session> ...
+schedule-agent reschedule <id> "03:00 tomorrow"
 ```
 
-If your local CLI differs, adjust the `AGENTS` mapping in `schedule_agent/cli.py`.
-
-## Development
-
-Run directly:
+Under the hood:
 
 ```bash
-python -m schedule_agent.cli
+atrm <job_id>
+at <new time>
 ```
+
+- old `at` job removed
+- job updated
+- job re-submitted automatically
+
+Delete a submitted job:
+
+```bash
+schedule-agent delete <id>
+```
+
+- `atrm` runs first
+- then the job is removed from queue and state
+
+Submitted jobs are marked with **`(S)`** in interactive and non-interactive job listings.
+
+## Storage
+
+Inspect state:
+
+```bash
+ls ~/.local/state/schedule-agent
+```
+
+Inspect prompt files:
+
+```bash
+ls ~/.local/share/schedule-agent/agent_prompts
+```
+
+The tool respects `XDG_STATE_HOME` and `XDG_DATA_HOME` if they are set.
+
+## Session discovery
+
+Inspect local session roots:
+
+```bash
+ls ~/.codex/sessions
+ls ~/.claude/projects
+```
+
+The scheduler shows the last 10 discovered sessions when you create a job or change a session interactively.
+
+## Asciinema demo
+
+Record:
+
+```bash
+./demo/record-demo.sh
+```
+
+Play:
+
+```bash
+asciinema play demo/demo.cast
+```
+
+Upload:
+
+```bash
+asciinema upload demo/demo.cast
+```
+
+## Design intent
+
+This tool is intentionally strict.
+
+```bash
+schedule-agent
+```
+
+It prioritizes:
+
+- predictability over convenience
+- explicit control over hidden behavior
+- filesystem state over in-memory abstraction
+
+It is designed for unattended execution.
 
 ## License
 

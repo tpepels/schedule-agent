@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -228,9 +229,11 @@ def cancel_at_job(job_id: str) -> bool:
     return proc.returncode == 0
 
 
-def schedule(job):
+def schedule(job, dry_run: bool = False):
     cmd = build_cmd(job)
     script = f"cd {shlex.quote(job['cwd'])}\nexport PATH=/usr/local/bin:/usr/bin:/bin\n{cmd} >> {shlex.quote(job['log'])} 2>&1\n"
+    if dry_run:
+        return f"Would schedule at: {job['when']}\n\n{script}"
     proc = subprocess.run(["at", job["when"]], input=script, text=True, capture_output=True)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "Failed to schedule job")
@@ -274,13 +277,16 @@ def format_job_label(job, state):
     return f"{job['id']}{submitted}  [{job['when']}]  [{job['agent']}]  [session={session}]"
 
 
-def list_jobs():
+def list_jobs_noninteractive() -> str:
     jobs = load_jobs()
     if not jobs:
-        info("No jobs.")
-        return
+        return "No jobs."
     state = load_state()
-    info("\n".join(format_job_label(job, state) for job in jobs))
+    return "\n".join(format_job_label(job, state) for job in jobs)
+
+
+def list_jobs():
+    info(list_jobs_noninteractive())
 
 
 def get_job_and_index(job_id: str):
@@ -299,11 +305,14 @@ def prepare_mutation(job_id: str):
     return was_submitted
 
 
-def apply_job_update(job_id: str, mutator: Callable[[dict], Optional[dict]], success_message: str | None = None):
+def apply_job_update(job_id: str, mutator: Callable[[dict], Optional[dict]], success_message: str | None = None, interactive: bool = True):
     jobs, idx, job = get_job_and_index(job_id)
     if job is None:
-        info("No such job.")
-        return
+        if interactive:
+            info("No such job.")
+        else:
+            print("No such job.")
+        return 1
     was_submitted = prepare_mutation(job_id)
     updated = mutator(dict(job))
     if updated is None:
@@ -314,8 +323,11 @@ def apply_job_update(job_id: str, mutator: Callable[[dict], Optional[dict]], suc
         if pf:
             Path(pf).unlink(missing_ok=True)
         if success_message:
-            info(success_message)
-        return
+            if interactive:
+                info(success_message)
+            else:
+                print(success_message)
+        return 0
     jobs[idx] = updated
     save_jobs(jobs)
     if was_submitted:
@@ -324,14 +336,27 @@ def apply_job_update(job_id: str, mutator: Callable[[dict], Optional[dict]], suc
             msg = success_message or "Updated."
             if out:
                 msg += f"\n\n{out}"
-            info(msg)
+            if interactive:
+                info(msg)
+            else:
+                print(msg)
+            return 0
         except RuntimeError as e:
             set_state(updated["id"], "queued", scheduled_for=updated["when"], log=updated["log"], cwd=updated["cwd"], agent=updated["agent"])
-            info((success_message or "Updated.") + f"\n\n{e}\n\nThe job was updated, but re-submission failed. It remains queued.")
+            msg = (success_message or "Updated.") + f"\n\n{e}\n\nThe job was updated, but re-submission failed. It remains queued."
+            if interactive:
+                info(msg)
+            else:
+                print(msg)
+            return 1
     else:
         set_state(updated["id"], "queued", scheduled_for=updated["when"], log=updated["log"], cwd=updated["cwd"], agent=updated["agent"])
         if success_message:
-            info(success_message)
+            if interactive:
+                info(success_message)
+            else:
+                print(success_message)
+        return 0
 
 
 def choose_job_action_from_list():
@@ -413,8 +438,8 @@ def choose_job_action_from_list():
     return result["action"], result["job"]
 
 
-def show_job(job):
-    info(
+def show_job_text(job) -> str:
+    return (
         f"id:         {job['id']}\n"
         f"agent:      {job['agent']}\n"
         f"when:       {job['when']}\n"
@@ -425,65 +450,124 @@ def show_job(job):
     )
 
 
-def reschedule_job(job_id: str):
+def show_job(job):
+    info(show_job_text(job))
+
+
+def cli_show_job(job_id: str) -> int:
+    _, _, job = get_job_and_index(job_id)
+    if job is None:
+        print("No such job.")
+        return 1
+    print(show_job_text(job))
+    return 0
+
+
+def reschedule_job(job_id: str, interactive: bool = True):
     jobs, _, job = get_job_and_index(job_id)
     if job is None:
-        info("No such job.")
-        return
+        if interactive:
+            info("No such job.")
+        else:
+            print("No such job.")
+        return 1
     old_when = job["when"]
-    new_when = resolve_time()
+    new_when = resolve_time() if interactive else None
+    if new_when is None:
+        print("New time required.")
+        return 1
 
     def mutate(d):
         d["when"] = new_when
         return d
 
-    apply_job_update(job_id, mutate, success_message=f"Rescheduled {job_id} from {old_when} to {new_when}.")
+    return apply_job_update(job_id, mutate, success_message=f"Rescheduled {job_id} from {old_when} to {new_when}.", interactive=interactive)
 
 
-def change_session(job_id: str):
+def cli_reschedule_job(job_id: str, new_when: str) -> int:
     jobs, _, job = get_job_and_index(job_id)
     if job is None:
-        info("No such job.")
-        return
-    new_session = choose_session(job["agent"])
+        print("No such job.")
+        return 1
+    old_when = job["when"]
+
+    def mutate(d):
+        d["when"] = new_when
+        return d
+
+    return apply_job_update(job_id, mutate, success_message=f"Rescheduled {job_id} from {old_when} to {new_when}.", interactive=False)
+
+
+def change_session(job_id: str, interactive: bool = True):
+    jobs, _, job = get_job_and_index(job_id)
+    if job is None:
+        if interactive:
+            info("No such job.")
+        else:
+            print("No such job.")
+        return 1
+    new_session = choose_session(job["agent"]) if interactive else None
+    if not interactive and new_session is None:
+        print("New session required.")
+        return 1
 
     def mutate(d):
         d["session"] = new_session
         return d
 
-    apply_job_update(job_id, mutate, success_message=f"Changed session for {job_id} to {new_session or 'new'}.")
+    return apply_job_update(job_id, mutate, success_message=f"Changed session for {job_id} to {new_session or 'new'}.", interactive=interactive)
 
 
-def remove_job(job_id: str):
-    if not confirm(f"Delete {job_id}?", default=False):
-        info("Cancelled.")
-        return
-    apply_job_update(job_id, lambda d: None, success_message="Deleted.")
+def cli_change_session(job_id: str, session: str | None) -> int:
+    _, _, job = get_job_and_index(job_id)
+    if job is None:
+        print("No such job.")
+        return 1
+
+    def mutate(d):
+        d["session"] = session
+        return d
+
+    return apply_job_update(job_id, mutate, success_message=f"Changed session for {job_id} to {session or 'new'}.", interactive=False)
 
 
-def create_and_maybe_submit():
+def remove_job(job_id: str, interactive: bool = True):
+    if interactive:
+        if not confirm(f"Delete {job_id}?", default=False):
+            info("Cancelled.")
+            return 1
+    return apply_job_update(job_id, lambda d: None, success_message="Deleted.", interactive=interactive)
+
+
+def create_and_maybe_submit(dry_run: bool = False):
     job = create_job()
     jobs = load_jobs()
     jobs.append(job)
     save_jobs(jobs)
     set_state(job["id"], "queued", log=job["log"], cwd=job["cwd"], agent=job["agent"])
+    if dry_run:
+        info(schedule(job, dry_run=True))
+        return 0
     if confirm("Submit now?", default=True):
         try:
             out = schedule(job)
             info("Submitted." + (f"\n\n{out}" if out else ""))
+            return 0
         except RuntimeError as e:
             info(f"{e}\n\nThe job was saved as queued.")
+            return 1
     else:
         info("Saved as queued.")
+        return 0
 
 
 def jobs_menu():
     while True:
         action, job = choose_job_action_from_list()
         if action in (None, "quit"):
-            return
+            return 0
         if job is None:
-            return
+            return 0
         if action == "view":
             show_job(job)
         elif action == "reschedule":
@@ -494,16 +578,59 @@ def jobs_menu():
             change_session(job["id"])
 
 
-def main():
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=APP_NAME, description="Schedule Codex and Claude CLI jobs.")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be scheduled during interactive create.")
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("list", help="List jobs.")
+    show_p = sub.add_parser("show", help="Show one job.")
+    show_p.add_argument("job_id")
+
+    del_p = sub.add_parser("delete", help="Delete one job.")
+    del_p.add_argument("job_id")
+
+    res_p = sub.add_parser("reschedule", help="Reschedule one job.")
+    res_p.add_argument("job_id")
+    res_p.add_argument("when", help='New time, e.g. "tomorrow 03:00" is not valid for at; use "03:00 tomorrow" or "now + 90 minutes".')
+
+    ses_p = sub.add_parser("session", help="Change session for one job.")
+    ses_p.add_argument("job_id")
+    ses_p.add_argument("session", nargs="?", help='Session id, or omit with --new to clear to "new session".')
+    ses_p.add_argument("--new", action="store_true", help="Clear the session and use a new session.")
+
+    return parser
+
+
+def main(argv: Sequence[str] | None = None):
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
     try:
+        if args.command == "list":
+            print(list_jobs_noninteractive())
+            return 0
+        if args.command == "show":
+            return cli_show_job(args.job_id)
+        if args.command == "delete":
+            return remove_job(args.job_id, interactive=False)
+        if args.command == "reschedule":
+            return cli_reschedule_job(args.job_id, args.when)
+        if args.command == "session":
+            if args.new:
+                return cli_change_session(args.job_id, None)
+            if args.session is None:
+                parser.error("session requires either a session id or --new")
+            return cli_change_session(args.job_id, args.session)
+
         action = choose("Action", ["Create job", "Jobs"], default="Create job")
         if action == "Create job":
-            create_and_maybe_submit()
-        else:
-            jobs_menu()
+            return create_and_maybe_submit(dry_run=args.dry_run)
+        return jobs_menu()
     except KeyboardInterrupt:
         print("\nCancelled.")
+        return 130
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
