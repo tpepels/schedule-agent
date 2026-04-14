@@ -47,6 +47,7 @@ from .transitions import (
     on_dependency_success,
     on_failure,
     on_reschedule,
+    on_resubmit_failed,
     on_retry,
     on_start,
     on_submit,
@@ -634,15 +635,12 @@ def apply_job_update(
                 print(msg)
             return 0
         except RuntimeError as e:
-            # Resubmit failed — leave as queued
-            updated_queued = dict(updated)
-            updated_queued["submission"] = "queued"
-            updated_queued["at_job_id"] = None
-            updated_queued["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # Resubmit failed — leave as queued via proper transition
+            failed_job = on_resubmit_failed(updated)
             _, reload_idx, _ = get_job_and_index(job_id)
             if reload_idx is not None:
                 fresh_jobs = load_jobs()
-                fresh_jobs[reload_idx] = updated_queued
+                fresh_jobs[reload_idx] = failed_job
                 save_jobs(fresh_jobs)
             set_state(updated["id"], "queued", scheduled_for=updated["when"], log=updated["log"], cwd=updated["cwd"], agent=updated["agent"])
             msg = (success_message or "Updated.") + f"\n\n{e}\n\nThe job was updated, but re-submission failed. It remains queued."

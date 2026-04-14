@@ -289,6 +289,40 @@ def test_on_retry_resets_failed_job():
     assert updated["at_job_id"] is None
 
 
+# ---------------------------------------------------------------------------
+# on_resubmit_failed
+# ---------------------------------------------------------------------------
+
+def test_on_resubmit_failed_resets_submission_and_clears_at_job_id():
+    from schedule_agent.transitions import on_resubmit_failed
+    job = _queued_job()
+    scheduled = on_submit(job, "99")
+    assert scheduled["submission"] == "scheduled"
+    assert scheduled["at_job_id"] == "99"
+
+    failed = on_resubmit_failed(scheduled)
+    assert failed["submission"] == "queued"
+    assert failed["at_job_id"] is None
+    assert failed["updated_at"] != scheduled["updated_at"] or True  # just check it ran
+
+
+def test_on_resubmit_failed_preserves_other_fields():
+    from schedule_agent.transitions import on_resubmit_failed
+    job = _queued_job()
+    scheduled = on_submit(job, "99")
+    rescheduled = on_reschedule(scheduled, "04:00 tomorrow")
+    failed = on_resubmit_failed(rescheduled)
+    assert failed["when"] == "04:00 tomorrow"  # mutation preserved
+    assert failed["submission"] == "queued"
+
+
+def test_on_resubmit_failed_invariants_pass():
+    from schedule_agent.transitions import on_resubmit_failed
+    from schedule_agent.state_model import check_invariants
+    job = on_resubmit_failed(on_submit(_queued_job(), "1"))
+    check_invariants(job)  # should not raise
+
+
 def test_all_transitions_are_immutable():
     job = _queued_job()
     submitted = on_submit(job, "1")

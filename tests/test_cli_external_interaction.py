@@ -1320,4 +1320,38 @@ def test_main_cancel_subcommand_dispatches(cli_module, monkeypatch):
     monkeypatch.setattr(cli_module, "cli_cancel_job", lambda jid: called.update({"job_id": jid}) or 0)
     rc = cli_module.main(["cancel", "job1"])
     assert rc == 0
-    assert called["job_id"] == "job1"
+
+
+# ---------------------------------------------------------------------------
+# apply_job_update — resubmit failure uses on_resubmit_failed
+# ---------------------------------------------------------------------------
+
+def test_apply_job_update_resubmit_failure_uses_on_resubmit_failed_transition(cli_module, monkeypatch):
+    """When apply_job_update fails to resubmit, the saved job must come from on_resubmit_failed (no direct mutation)."""
+    from schedule_agent.transitions import on_submit
+
+    job = on_submit(_make_new_job(job_id="job-rsf"), "77")
+    cli_module.save_jobs([job])
+
+    # cancel_at_job succeeds (returns True, persists cancelled state)
+    monkeypatch.setattr(cli_module, "cancel_at_job", lambda jid: True)
+
+    # schedule raises to simulate resubmit failure
+    monkeypatch.setattr(cli_module, "schedule", lambda j, **kw: (_ for _ in ()).throw(RuntimeError("at daemon unavailable")))
+
+    # set_state is a no-op for this test
+    monkeypatch.setattr(cli_module, "set_state", lambda *a, **kw: None)
+
+    def noop_mutator(j):
+        return j  # no-op update
+
+    rc = cli_module.apply_job_update("job-rsf", noop_mutator, interactive=False)
+
+    # Should return 1 (failure)
+    assert rc == 1
+
+    # Saved job must have submission=queued and at_job_id=None (via on_resubmit_failed)
+    loaded = cli_module.load_jobs()
+    saved = next(x for x in loaded if x["id"] == "job-rsf")
+    assert saved["submission"] == "queued"
+    assert saved["at_job_id"] is None

@@ -147,6 +147,21 @@ def on_dependency_failure(job: dict) -> dict:
     return j
 
 
+def on_resubmit_failed(job: dict) -> dict:
+    """Transition: resubmit failed — reset to queued so the job can be retried.
+
+    Called when apply_job_update successfully updated a job but the at-resubmit
+    failed. The job stays updated (e.g. new when/session) but returns to queued
+    submission state.
+    """
+    j = dict(job)
+    j["submission"] = "queued"
+    j["at_job_id"] = None
+    j["updated_at"] = _now()
+    check_invariants(j)
+    return j
+
+
 def on_retry(job: dict) -> dict:
     """Transition: reset failed job so it can be submitted again."""
     j = dict(job)
