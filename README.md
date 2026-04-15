@@ -8,10 +8,6 @@ Persistent job scheduling for short-lived agent sessions.
 
 ## What
 
-```bash
-schedule-agent
-````
-
 `schedule-agent` is a CLI tool for scheduling Codex and Claude prompts to run later.
 
 It lets you:
@@ -32,9 +28,7 @@ You run something like:
 ```bash
 claude -p "do X"
 ```
-
 or:
-
 ```bash
 codex exec "do X"
 ```
@@ -46,13 +40,7 @@ Then one of the usual things happens:
 * a long task gets interrupted
 * you need the work to continue while you are away
 
-```bash
-schedule-agent
-```
-
-exists for exactly that situation.
-
-It lets you queue work to run **after limits reset**, so short-lived agent sessions do not force short-lived workflows.
+schedule-agent exists for exactly that situation. It lets you queue work to run at a later time of your choosing, so short-lived agent sessions do not force short-lived workflows.
 
 ---
 
@@ -88,17 +76,7 @@ schedule-agent
 
 ## Requirements
 
-This tool is intended for:
-
-```bash
-uname -s
-```
-
-Expected result:
-
-```text
-Linux
-```
+This tool is intended for Linux users only!
 
 It depends on the system `at` scheduler, so these commands must exist:
 
@@ -107,7 +85,9 @@ which at
 which atrm
 ```
 
-And the scheduler daemon must be running:
+If you don't have at installed, install it using your package management tool and make sure to enable and start it.
+
+Then check if th scheduler daemon is running:
 
 ```bash
 systemctl status atd
@@ -311,16 +291,3 @@ export EDITOR="code --wait"
 ## License
 
 MIT
-
-```
-
-What changed from your version:
-
-- removed the weak ASCII logo
-- added a real **Requirements** section
-- explicitly says **Linux**
-- explicitly explains **`at` / `atrm` / `atd`**
-- keeps the flow: what → why → install → requirements → use → remarks
-- trims repetition a bit so it reads more like a tool README and less like a product page
-
-The only extra thing I’d add to the repo after this is a tiny `install.sh` note in the README if your installer also bootstraps the Python deps internally.
