@@ -87,9 +87,12 @@ def migrate_job(
         "waiting_dependency" if migrated.get("depends_on") else "ready"
     )
     migrated["created_at"] = normalize_legacy_timestamp(migrated.get("created_at")) or now_iso()
-    migrated["updated_at"] = normalize_legacy_timestamp(
-        migrated.get("updated_at") or (legacy_state or {}).get("updated_at")
-    ) or now_iso()
+    migrated["updated_at"] = (
+        normalize_legacy_timestamp(
+            migrated.get("updated_at") or (legacy_state or {}).get("updated_at")
+        )
+        or now_iso()
+    )
     migrated["last_started_at"] = normalize_legacy_timestamp(migrated.get("last_started_at"))
     migrated["last_run_at"] = normalize_legacy_timestamp(
         migrated.get("last_run_at") or (legacy_state or {}).get("last_run_at")
