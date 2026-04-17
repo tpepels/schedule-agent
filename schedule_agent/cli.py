@@ -224,6 +224,7 @@ def extract_session_title(path: str, agent: str) -> str | None:
     agent = agent.lower().strip()
 
     if agent == "claude":
+        # Old Claude format: explicit AI-generated title
         for obj in iter_json():
             if obj.get("type") == "ai-title":
                 title = obj.get("aiTitle")
@@ -231,9 +232,28 @@ def extract_session_title(path: str, agent: str) -> str | None:
                     title = title.strip()
                     if title:
                         return title
+
+        # Newer Claude format: first real non-meta user message
+        for obj in iter_json():
+            if obj.get("type") != "user":
+                continue
+            if obj.get("isMeta"):
+                continue
+
+            message = obj.get("message", {})
+            if message.get("role") != "user":
+                continue
+
+            content = message.get("content")
+            if isinstance(content, str):
+                content = content.strip()
+                if content:
+                    return content.splitlines()[0]
+
         return None
 
     if agent == "codex":
+        # Primary: explicit user_message event
         for obj in iter_json():
             if obj.get("type") == "event_msg":
                 payload = obj.get("payload", {})
@@ -243,6 +263,20 @@ def extract_session_title(path: str, agent: str) -> str | None:
                         message = message.strip()
                         if message:
                             return message.splitlines()[0]
+
+        # Fallback: first structured user response_item
+        for obj in iter_json():
+            if obj.get("type") == "response_item":
+                payload = obj.get("payload", {})
+                if payload.get("type") == "message" and payload.get("role") == "user":
+                    for item in payload.get("content", []):
+                        if item.get("type") == "input_text":
+                            text = item.get("text")
+                            if isinstance(text, str):
+                                text = text.strip()
+                                if text:
+                                    return text.splitlines()[0]
+
         return None
 
     return None
@@ -523,11 +557,32 @@ def _format_job_row(job: dict, id_width: int) -> str:
     agent = job.get("agent", "")
     session_mode = job.get("session_mode", "new")
 
+    # Determine if job is in the past
+    is_past = False
+    from datetime import datetime
+    when = job.get("when")
+    # Try to parse 'when' as a datetime if possible
+    if when:
+        try:
+            # Accepts formats like '2026-04-15 12:00:00' or '15:00 tomorrow', fallback to string compare
+            if len(when) >= 19 and when[4] == '-' and when[7] == '-':
+                job_time = datetime.strptime(when[:19], "%Y-%m-%d %H:%M:%S")
+                is_past = job_time < datetime.now()
+            # else: could add more parsing for other formats if needed
+        except Exception:
+            pass
+    # Also consider jobs with execution finished as past
+    if display in ("done", "failed", "cancelled"):
+        is_past = True
+
+    past_tag = " [past]" if is_past else ""
+
     row = (
         f"{job_id.ljust(id_width)} "
         f"{display.ljust(STATE_W)} "
         f"{agent.ljust(AGENT_W)} "
         f"{session_mode.ljust(SESSION_W)}"
+        f"{past_tag}"
     )
 
     dep = job.get("depends_on")
