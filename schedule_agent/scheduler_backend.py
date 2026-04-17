@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 
@@ -46,6 +47,7 @@ def parse_atq_line(line: str) -> AtqEntry | None:
 
 def build_script(job: dict) -> str:
     cmd = build_agent_cmd(job)
+    sa_bin = shlex.quote(shutil.which("schedule-agent") or "schedule-agent")
     return "\n".join(
         [
             f"cd {shlex.quote(job['cwd'])} || exit 1",
@@ -55,14 +57,14 @@ def build_script(job: dict) -> str:
             f'log_file={shlex.quote(job["log_dir"])}/"$started_at".log',
             'exec >>"$log_file" 2>&1',
             (
-                f"schedule-agent mark running {shlex.quote(job['id'])} "
+                f"{sa_bin} mark running {shlex.quote(job['id'])} "
                 '--started-at "$started_at" --log-file "$log_file"'
             ),
             (
                 'trap \'code=$?; finished_at="$(date --iso-8601=seconds)"; '
-                f'if [ "$code" -eq 0 ]; then schedule-agent mark done {shlex.quote(job["id"])} '
+                f'if [ "$code" -eq 0 ]; then {sa_bin} mark done {shlex.quote(job["id"])} '
                 '--finished-at "$finished_at" --exit-code "$code" --log-file "$log_file"; '
-                f"else schedule-agent mark failed {shlex.quote(job['id'])} "
+                f"else {sa_bin} mark failed {shlex.quote(job['id'])} "
                 '--finished-at "$finished_at" --exit-code "$code" --log-file "$log_file"; fi\' EXIT'
             ),
             f'echo "[schedule-agent] start job={job["id"]} scheduled_for={job["scheduled_for"]}"',

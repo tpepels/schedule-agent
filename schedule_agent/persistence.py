@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .scheduler_backend import normalize_legacy_when, query_atq
 from .state_model import check_invariants
-from .time_utils import now_iso, title_from_prompt
+from .time_utils import normalize_legacy_timestamp, now_iso, title_from_prompt
 
 APP_NAME = "schedule-agent"
 
@@ -86,12 +86,14 @@ def migrate_job(
     migrated["readiness"] = migrated.get("readiness") or (
         "waiting_dependency" if migrated.get("depends_on") else "ready"
     )
-    migrated["created_at"] = migrated.get("created_at") or now_iso()
-    migrated["updated_at"] = (
-        migrated.get("updated_at") or (legacy_state or {}).get("updated_at") or now_iso()
+    migrated["created_at"] = normalize_legacy_timestamp(migrated.get("created_at")) or now_iso()
+    migrated["updated_at"] = normalize_legacy_timestamp(
+        migrated.get("updated_at") or (legacy_state or {}).get("updated_at")
+    ) or now_iso()
+    migrated["last_started_at"] = normalize_legacy_timestamp(migrated.get("last_started_at"))
+    migrated["last_run_at"] = normalize_legacy_timestamp(
+        migrated.get("last_run_at") or (legacy_state or {}).get("last_run_at")
     )
-    migrated["last_started_at"] = migrated.get("last_started_at")
-    migrated["last_run_at"] = migrated.get("last_run_at") or (legacy_state or {}).get("last_run_at")
     migrated["last_exit_code"] = migrated.get("last_exit_code")
 
     migrated["title"] = migrated.get("title") or _legacy_prompt_title(

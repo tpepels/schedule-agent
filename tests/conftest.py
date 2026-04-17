@@ -1,7 +1,14 @@
 import importlib
+import os
+import time
 from types import SimpleNamespace
 
 import pytest
+
+
+def pytest_configure(config):
+    os.environ["TZ"] = "UTC"
+    time.tzset()
 
 
 @pytest.fixture

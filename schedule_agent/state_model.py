@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .time_utils import parse_iso_datetime
+
 SUBMISSION = frozenset({"queued", "scheduled", "running", "cancelled"})
 EXECUTION = frozenset({"pending", "running", "success", "failed"})
 SESSION_MODE = frozenset({"new", "resume"})
@@ -84,8 +86,14 @@ def check_invariants(job: dict) -> None:
         errors.append("Invariant 7: readiness=blocked requires depends_on")
     if job.get("execution") in ("success", "failed") and not job.get("last_run_at"):
         errors.append("Invariant 8: execution=success|failed requires last_run_at")
-    if not job.get("scheduled_for"):
+    scheduled_for = job.get("scheduled_for")
+    if not scheduled_for:
         errors.append("Invariant 9: scheduled_for is required")
+    else:
+        try:
+            parse_iso_datetime(scheduled_for)
+        except ValueError:
+            errors.append(f"Invariant 9: scheduled_for is not a valid ISO datetime: {scheduled_for!r}")
     if not job.get("title"):
         errors.append("Invariant 10: title is required")
     if not job.get("log_dir"):

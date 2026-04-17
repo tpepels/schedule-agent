@@ -16,7 +16,7 @@ def _job():
         "session_mode": "new",
         "session_id": None,
         "cwd": "/tmp/project",
-        "scheduled_for": "2026-04-18T09:00:00+0100",
+        "scheduled_for": "2026-04-18T09:00:00+0000",
         "log_dir": "/tmp/project/logs/job1",
     }
 
@@ -38,7 +38,7 @@ def test_build_script_uses_wrapper_and_stream_redirection(app_modules):
     assert "schedule-agent mark running job1" in script
     assert "schedule-agent mark done job1" in script
     assert "schedule-agent mark failed job1" in script
-    assert "scheduled_for=2026-04-18T09:00:00+0100" in script
+    assert "scheduled_for=2026-04-18T09:00:00+0000" in script
 
 
 def test_submit_job_uses_at_dash_t(app_modules, monkeypatch):
@@ -117,5 +117,5 @@ def test_query_atq_reports_error(app_modules, monkeypatch):
 def test_submit_job_dry_run_shows_wrapper_preview(app_modules):
     at_job_id, output = app_modules.scheduler_backend.submit_job(_job(), dry_run=True)
     assert at_job_id is None
-    assert "Would schedule at 2026-04-18T09:00:00+0100 via `at -t 202604180900.00`" in output
+    assert "Would schedule at 2026-04-18T09:00:00+0000 via `at -t 202604180900.00`" in output
     assert "schedule-agent mark running job1" in output

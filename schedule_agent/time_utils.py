@@ -65,7 +65,30 @@ def iso_to_at_time(value: str) -> str:
 def sort_key_for_iso(value: str | None) -> tuple[int, float]:
     if not value:
         return (1, float("inf"))
-    return (0, parse_iso_datetime(value).timestamp())
+    try:
+        return (0, parse_iso_datetime(value).timestamp())
+    except ValueError:
+        return (1, float("inf"))
+
+
+_LEGACY_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def normalize_legacy_timestamp(value: str | None) -> str | None:
+    """Convert a legacy non-ISO timestamp (YYYY-MM-DD HH:MM:SS) to ISO format.
+
+    Returns the value unchanged if it already parses as ISO, or None if the
+    input is empty. Raises ValueError for unrecognised formats.
+    """
+    if not value:
+        return None
+    try:
+        parse_iso_datetime(value)
+        return value
+    except ValueError:
+        pass
+    dt = datetime.strptime(value.strip(), _LEGACY_DATETIME_FORMAT)
+    return dt.astimezone().strftime(ISO_SECONDS_FORMAT)
 
 
 def title_from_prompt(prompt: str) -> str:
