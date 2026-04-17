@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime
 from pathlib import Path
 
+from .scheduler_backend import normalize_legacy_when, query_atq
 from .state_model import check_invariants
+from .time_utils import now_iso, title_from_prompt
 
 
 APP_NAME = "schedule-agent"
@@ -19,14 +20,17 @@ def _data_home() -> Path:
     return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / APP_NAME
 
 
-def _ensure_dirs() -> tuple[Path, Path, Path, Path]:
+def _ensure_dirs() -> tuple[Path, Path, Path, Path, Path]:
     state_dir = _state_home()
     data_dir = _data_home()
     prompt_dir = data_dir / "agent_prompts"
+    logs_dir = state_dir / "logs"
+    queue_file = state_dir / "agent_queue.jsonl"
     state_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
     prompt_dir.mkdir(parents=True, exist_ok=True)
-    return state_dir, data_dir, prompt_dir, state_dir / "agent_queue.jsonl"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir, data_dir, prompt_dir, logs_dir, queue_file
 
 
 def _queue_file() -> Path:
@@ -37,13 +41,17 @@ def _legacy_state_file() -> Path:
     return _state_home() / "agent_queue_state.json"
 
 
-def _now() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def job_log_dir(job_id: str) -> str:
+    _ensure_dirs()
+    return str(_state_home() / "logs" / job_id)
 
 
-# ---------------------------------------------------------------------------
-# Migration helpers
-# ---------------------------------------------------------------------------
+def _legacy_prompt_title(prompt_file: str) -> str:
+    try:
+        return title_from_prompt(Path(prompt_file).read_text(encoding="utf-8"))
+    except Exception:
+        return "(untitled job)"
+
 
 _STATUS_MAP = {
     "queued": ("queued", "pending"),
@@ -51,105 +59,99 @@ _STATUS_MAP = {
     "running": ("running", "running"),
     "success": ("queued", "success"),
     "failed": ("queued", "failed"),
+    "cancelled": ("cancelled", "pending"),
 }
 
 
-def migrate_job(job: dict, legacy_state: dict | None = None) -> dict:
-    """Convert a job from the old single-status model to the new multi-dimensional model.
-
-    If the job already has a ``submission`` field it is returned unchanged.
-    ``legacy_state`` is the per-job entry from ``agent_queue_state.json``.
-    """
-    if "submission" in job:
+def migrate_job(job: dict, legacy_state: dict | None = None, atq_entries: dict[str, object] | None = None) -> dict:
+    if "scheduled_for" in job and "title" in job and "log_dir" in job:
         return job
 
     migrated = dict(job)
-
-    # session -> session_mode / session_id
     old_session = migrated.pop("session", None)
-    migrated["session_mode"] = "resume" if old_session else "new"
-    migrated["session_id"] = old_session
+    migrated["session_mode"] = migrated.get("session_mode") or ("resume" if old_session else "new")
+    migrated["session_id"] = migrated.get("session_id", old_session)
 
-    # Map old status
     old_status = (legacy_state or {}).get("status", "queued")
     submission, execution = _STATUS_MAP.get(old_status, ("queued", "pending"))
-    migrated["submission"] = submission
-    migrated["execution"] = execution
+    migrated["submission"] = migrated.get("submission", submission)
+    migrated["execution"] = migrated.get("execution", execution)
 
-    # at_job_id — only kept when scheduled
-    if submission == "scheduled" and legacy_state and legacy_state.get("at_job_id"):
-        migrated["at_job_id"] = legacy_state["at_job_id"]
-    else:
-        migrated["at_job_id"] = None
+    at_job_id = migrated.get("at_job_id")
+    if not at_job_id and migrated["submission"] == "scheduled":
+        at_job_id = (legacy_state or {}).get("at_job_id")
+    migrated["at_job_id"] = at_job_id
 
-    # readiness
-    if migrated.get("depends_on"):
-        migrated["readiness"] = "waiting_dependency"
-    else:
-        migrated["readiness"] = "ready"
+    migrated["readiness"] = migrated.get("readiness") or ("waiting_dependency" if migrated.get("depends_on") else "ready")
+    migrated["created_at"] = migrated.get("created_at") or now_iso()
+    migrated["updated_at"] = migrated.get("updated_at") or (legacy_state or {}).get("updated_at") or now_iso()
+    migrated["last_started_at"] = migrated.get("last_started_at")
+    migrated["last_run_at"] = migrated.get("last_run_at") or (legacy_state or {}).get("last_run_at")
+    migrated["last_exit_code"] = migrated.get("last_exit_code")
 
-    # timestamps
-    migrated.setdefault("created_at", _now())
-    migrated["updated_at"] = (legacy_state or {}).get("updated_at") or _now()
-    # last_run_at is set when execution completed
-    if execution in ("success", "failed"):
-        migrated["last_run_at"] = migrated.get("last_run_at") or (legacy_state or {}).get("last_run_at") or _now()
-    else:
-        migrated.setdefault("last_run_at", None)
+    migrated["title"] = migrated.get("title") or _legacy_prompt_title(migrated.get("prompt_file", ""))
+    migrated["log_dir"] = migrated.get("log_dir") or job_log_dir(migrated["id"])
+    if not migrated.get("last_log_file"):
+        legacy_log = migrated.get("log")
+        migrated["last_log_file"] = legacy_log if legacy_log and Path(legacy_log).exists() else None
+
+    scheduled_for = migrated.get("scheduled_for")
+    if not scheduled_for and at_job_id and atq_entries:
+        entry = atq_entries.get(str(at_job_id))
+        if entry:
+            scheduled_for = entry.scheduled_for
+    if not scheduled_for:
+        scheduled_for = normalize_legacy_when(migrated.get("when"))
+    if not scheduled_for:
+        raise ValueError("Could not resolve legacy schedule into scheduled_for")
+    migrated["scheduled_for"] = scheduled_for
+    migrated.pop("when", None)
 
     return migrated
 
 
-# ---------------------------------------------------------------------------
-# Core persistence
-# ---------------------------------------------------------------------------
-
 def load_jobs() -> list[dict]:
-    """Load all jobs from the queue file, migrating legacy entries on the fly."""
     queue_file = _queue_file()
     _ensure_dirs()
     if not queue_file.exists():
         return []
 
-    raw = [
+    raw_jobs = [
         json.loads(line)
         for line in queue_file.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
 
-    # Load legacy state file if it exists so we can merge it during migration
-    legacy: dict = {}
-    legacy_file = _legacy_state_file()
-    if legacy_file.exists():
-        try:
-            legacy = json.loads(legacy_file.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+    legacy = load_legacy_state()
+    at_job_ids = [
+        str((job.get("at_job_id") or legacy.get(job.get("id"), {}).get("at_job_id")))
+        for job in raw_jobs
+        if (job.get("scheduled_for") is None and (job.get("at_job_id") or legacy.get(job.get("id"), {}).get("at_job_id")))
+    ]
+    atq_entries, _ = query_atq(at_job_ids or None) if at_job_ids else ({}, None)
 
     results = []
-    for j in raw:
+    for job in raw_jobs:
         try:
-            migrated = migrate_job(j, legacy.get(j.get("id")))
+            migrated = migrate_job(job, legacy.get(job.get("id")), atq_entries)
             check_invariants(migrated)
             results.append(migrated)
-        except Exception as e:
-            job_id = j.get("id", "<unknown>")
-            results.append({"id": job_id, "_invalid": True, "_error": str(e)})
+        except Exception as exc:
+            job_id = job.get("id", "<unknown>")
+            results.append({"id": job_id, "_invalid": True, "_error": str(exc)})
     return results
 
 
 def save_jobs(jobs: list[dict]) -> None:
-    """Persist jobs to the queue file."""
     queue_file = _queue_file()
     _ensure_dirs()
     queue_file.write_text(
-        "\n".join(json.dumps(j) for j in jobs),
+        "\n".join(json.dumps(job, ensure_ascii=False) for job in jobs),
         encoding="utf-8",
     )
 
 
 def find_job(jobs: list[dict], job_id: str) -> tuple[int, dict] | tuple[None, None]:
-    """Return (index, job) or (None, None) if not found."""
     for idx, job in enumerate(jobs):
         if job["id"] == job_id:
             return idx, job
@@ -157,8 +159,7 @@ def find_job(jobs: list[dict], job_id: str) -> tuple[int, dict] | tuple[None, No
 
 
 def update_job_in_list(jobs: list[dict], updated: dict) -> list[dict]:
-    """Return a new list with the matching job replaced."""
-    return [updated if j["id"] == updated["id"] else j for j in jobs]
+    return [updated if job["id"] == updated["id"] else job for job in jobs]
 
 
 def write_prompt_file(prompt_dir: Path, job_id: str, prompt: str) -> str:
@@ -166,10 +167,6 @@ def write_prompt_file(prompt_dir: Path, job_id: str, prompt: str) -> str:
     path.write_text(prompt, encoding="utf-8")
     return str(path)
 
-
-# ---------------------------------------------------------------------------
-# Legacy state file helpers (kept for backward compat and tests)
-# ---------------------------------------------------------------------------
 
 def load_legacy_state() -> dict:
     _ensure_dirs()
