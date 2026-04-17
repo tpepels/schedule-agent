@@ -113,7 +113,10 @@ def query_atq(job_ids: list[str] | None = None) -> tuple[dict[str, AtqEntry], st
     cmd = ["atq", "-o", ATQ_TIME_FORMAT]
     if job_ids:
         cmd.extend(job_ids)
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        return {}, "atq unavailable"
     if proc.returncode != 0:
         return {}, proc.stderr.strip() or "atq failed"
 
