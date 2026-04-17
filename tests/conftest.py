@@ -9,12 +9,12 @@ def app_modules(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
 
+    import schedule_agent.cli as cli
+    import schedule_agent.operations as operations
     import schedule_agent.persistence as persistence
     import schedule_agent.scheduler_backend as scheduler_backend
-    import schedule_agent.operations as operations
-    import schedule_agent.cli as cli
-    import schedule_agent.transitions as transitions
     import schedule_agent.state_model as state_model
+    import schedule_agent.transitions as transitions
 
     persistence = importlib.reload(persistence)
     scheduler_backend = importlib.reload(scheduler_backend)

@@ -4,7 +4,6 @@ import re
 import subprocess
 from datetime import datetime
 
-
 ISO_SECONDS_FORMAT = "%Y-%m-%dT%H:%M:%S%z"
 DISPLAY_MINUTE_FORMAT = "%Y-%m-%d %H:%M"
 DISPLAY_SECOND_FORMAT = "%Y-%m-%d %H:%M:%S"

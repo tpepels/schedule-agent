@@ -34,7 +34,7 @@ def test_resolve_schedule_spec_normalizes_shorthand(app_modules, monkeypatch):
 
 def test_build_script_uses_wrapper_and_stream_redirection(app_modules):
     script = app_modules.scheduler_backend.build_script(_job())
-    assert "exec >>\"$log_file\" 2>&1" in script
+    assert 'exec >>"$log_file" 2>&1' in script
     assert "schedule-agent mark running job1" in script
     assert "schedule-agent mark done job1" in script
     assert "schedule-agent mark failed job1" in script
@@ -57,6 +57,18 @@ def test_submit_job_uses_at_dash_t(app_modules, monkeypatch):
     assert "job 42" in output
 
 
+def test_submit_job_raises_when_at_output_has_no_job_id(app_modules, monkeypatch):
+    backend = app_modules.scheduler_backend
+    monkeypatch.setattr(
+        backend.subprocess,
+        "run",
+        lambda *args, **kwargs: _Proc(stderr="warning: scheduled, but no id reported\n"),
+    )
+
+    with pytest.raises(RuntimeError, match="Could not determine at job id"):
+        backend.submit_job(_job())
+
+
 def test_parse_atq_line_and_query_atq(app_modules, monkeypatch):
     backend = app_modules.scheduler_backend
 
@@ -70,6 +82,24 @@ def test_parse_atq_line_and_query_atq(app_modules, monkeypatch):
     assert error is None
     assert entries["42"].scheduled_for == "2026-04-18T09:00:00+0100"
     assert entries["42"].queue == "a"
+
+
+def test_query_atq_ignores_malformed_rows_and_scopes_requested_ids(app_modules, monkeypatch):
+    backend = app_modules.scheduler_backend
+    captured = {}
+
+    def fake_run(cmd, *args, **kwargs):
+        captured["cmd"] = cmd
+        return _Proc(
+            stdout=("garbage row\n42 2026-04-18T09:00:00+0100 a tom\n99 not-a-timestamp a tom\n")
+        )
+
+    monkeypatch.setattr(backend.subprocess, "run", fake_run)
+
+    entries, error = backend.query_atq(["42", "99"])
+    assert error is None
+    assert captured["cmd"] == ["atq", "-o", backend.ATQ_TIME_FORMAT, "42", "99"]
+    assert list(entries) == ["42"]
 
 
 def test_query_atq_reports_error(app_modules, monkeypatch):

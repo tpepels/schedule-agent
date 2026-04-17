@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 SUBMISSION = frozenset({"queued", "scheduled", "running", "cancelled"})
 EXECUTION = frozenset({"pending", "running", "success", "failed"})
 SESSION_MODE = frozenset({"new", "resume"})

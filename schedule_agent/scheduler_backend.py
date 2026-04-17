@@ -6,8 +6,12 @@ import subprocess
 from dataclasses import dataclass
 
 from .execution import build_agent_cmd
-from .time_utils import iso_to_at_time, normalize_schedule_input, parse_iso_datetime, resolve_schedule_input
-
+from .time_utils import (
+    iso_to_at_time,
+    normalize_schedule_input,
+    parse_iso_datetime,
+    resolve_schedule_input,
+)
 
 ATQ_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S%z"
 
@@ -47,21 +51,21 @@ def build_script(job: dict) -> str:
             f"cd {shlex.quote(job['cwd'])} || exit 1",
             "export PATH=/usr/local/bin:/usr/bin:/bin",
             f"mkdir -p {shlex.quote(job['log_dir'])} || exit 1",
-            "started_at=\"$(date --iso-8601=seconds)\"",
-            f"log_file={shlex.quote(job['log_dir'])}/\"$started_at\".log",
-            "exec >>\"$log_file\" 2>&1",
+            'started_at="$(date --iso-8601=seconds)"',
+            f'log_file={shlex.quote(job["log_dir"])}/"$started_at".log',
+            'exec >>"$log_file" 2>&1',
             (
                 f"schedule-agent mark running {shlex.quote(job['id'])} "
-                "--started-at \"$started_at\" --log-file \"$log_file\""
+                '--started-at "$started_at" --log-file "$log_file"'
             ),
             (
-                "trap 'code=$?; finished_at=\"$(date --iso-8601=seconds)\"; "
-                f"if [ \"$code\" -eq 0 ]; then schedule-agent mark done {shlex.quote(job['id'])} "
-                "--finished-at \"$finished_at\" --exit-code \"$code\" --log-file \"$log_file\"; "
+                'trap \'code=$?; finished_at="$(date --iso-8601=seconds)"; '
+                f'if [ "$code" -eq 0 ]; then schedule-agent mark done {shlex.quote(job["id"])} '
+                '--finished-at "$finished_at" --exit-code "$code" --log-file "$log_file"; '
                 f"else schedule-agent mark failed {shlex.quote(job['id'])} "
-                "--finished-at \"$finished_at\" --exit-code \"$code\" --log-file \"$log_file\"; fi' EXIT"
+                '--finished-at "$finished_at" --exit-code "$code" --log-file "$log_file"; fi\' EXIT'
             ),
-            f"echo \"[schedule-agent] start job={job['id']} scheduled_for={job['scheduled_for']}\"",
+            f'echo "[schedule-agent] start job={job["id"]} scheduled_for={job["scheduled_for"]}"',
             cmd,
             "",
         ]
@@ -76,10 +80,7 @@ def submit_job(job: dict, dry_run: bool = False) -> tuple[str | None, str]:
     script = build_script(job)
     at_time = iso_to_at_time(job["scheduled_for"])
     if dry_run:
-        preview = (
-            f"Would schedule at {job['scheduled_for']} via `at -t {at_time}`\n\n"
-            f"{script}"
-        )
+        preview = f"Would schedule at {job['scheduled_for']} via `at -t {at_time}`\n\n{script}"
         return None, preview
 
     proc = subprocess.run(

@@ -32,7 +32,13 @@ def build_agent_cmd(job: dict) -> str:
 
     if session_id and session_mode == "resume":
         if job["agent"] == "codex":
-            return f"{cfg['bin']} exec resume {shlex.quote(session_id)} \"$(cat {prompt_path})\" < /dev/null"
-        return f"{cfg['bin']} --resume {shlex.quote(session_id)} {base} \"$(cat {prompt_path})\" < /dev/null"
+            return (
+                f"{cfg['bin']} exec resume {shlex.quote(session_id)} "
+                f'"$(cat {prompt_path})" < /dev/null'
+            )
+        return (
+            f"{cfg['bin']} --resume {shlex.quote(session_id)} {base} "
+            f'"$(cat {prompt_path})" < /dev/null'
+        )
 
-    return f"{cfg['bin']} {base} \"$(cat {prompt_path})\" < /dev/null"
+    return f'{cfg["bin"]} {base} "$(cat {prompt_path})" < /dev/null'

@@ -18,7 +18,13 @@ from .persistence import (
     update_job_in_list,
     write_prompt_file,
 )
-from .scheduler_backend import query_atq, query_atq_entry, remove_at_job, resolve_schedule_spec, submit_job
+from .scheduler_backend import (
+    query_atq,
+    query_atq_entry,
+    remove_at_job,
+    resolve_schedule_spec,
+    submit_job,
+)
 from .state_model import (
     can_change_session,
     can_delete,
@@ -27,7 +33,6 @@ from .state_model import (
     can_retry,
     can_submit,
     can_unschedule,
-    check_invariants,
     derive_display_state,
     display_label,
     scheduler_label,
@@ -83,7 +88,11 @@ def _prompt_dir() -> Path:
     return _data_home() / "agent_prompts"
 
 
-def _job_with_scheduler(job: dict, atq_entries: dict[str, object] | None = None, atq_error: str | None = None) -> dict:
+def _job_with_scheduler(
+    job: dict,
+    atq_entries: dict[str, object] | None = None,
+    atq_error: str | None = None,
+) -> dict:
     if job.get("_invalid"):
         view = dict(job)
         view["display_state"] = "invalid"
@@ -124,7 +133,9 @@ def _job_with_scheduler(job: dict, atq_entries: dict[str, object] | None = None,
     if entry.scheduled_for != job["scheduled_for"]:
         view["scheduler_status"] = "drifted"
         view["scheduler_label"] = scheduler_label("drifted")
-        view["drift_reason"] = f"Internal time {job['scheduled_for']} differs from atq time {entry.scheduled_for}."
+        view["drift_reason"] = (
+            f"Internal time {job['scheduled_for']} differs from atq time {entry.scheduled_for}."
+        )
         return view
 
     view["scheduler_status"] = "queued"
@@ -155,7 +166,11 @@ def list_job_views(filter_name: str = "all") -> tuple[list[dict], str | None]:
     views = [_job_with_scheduler(job, atq_entries, atq_error) for job in jobs]
 
     if filter_name == "active":
-        views = [job for job in views if not _terminal(job["display_state"]) and job["display_state"] != "invalid"]
+        views = [
+            job
+            for job in views
+            if not _terminal(job["display_state"]) and job["display_state"] != "invalid"
+        ]
     elif filter_name == "completed":
         views = [job for job in views if _terminal(job["display_state"])]
 
@@ -355,7 +370,9 @@ def submit_or_repair_job(job_id: str) -> dict:
         if not can_submit(working):
             raise OperationError(
                 f"Job {job_id} is not submittable "
-                f"(submission={working['submission']}, execution={working['execution']}, readiness={working['readiness']})"
+                f"(submission={working['submission']}, "
+                f"execution={working['execution']}, "
+                f"readiness={working['readiness']})"
             )
         submitted, _ = _resubmit(working)
         jobs[idx] = submitted
@@ -400,14 +417,29 @@ def _update_dependents(jobs: list[dict], parent_id: str, parent_result: str) -> 
     return updated_jobs
 
 
-def mark_finished(job_id: str, finished_at: str, exit_code: int, log_file: str | None = None) -> dict:
+def mark_finished(
+    job_id: str,
+    finished_at: str,
+    exit_code: int,
+    log_file: str | None = None,
+) -> dict:
     with _locked_queue():
         jobs, idx, job = _load_locked_job(job_id)
         if exit_code == 0:
-            updated = on_success(job, finished_at=finished_at, exit_code=exit_code, log_file=log_file)
+            updated = on_success(
+                job,
+                finished_at=finished_at,
+                exit_code=exit_code,
+                log_file=log_file,
+            )
             result = "success"
         else:
-            updated = on_failure(job, finished_at=finished_at, exit_code=exit_code, log_file=log_file)
+            updated = on_failure(
+                job,
+                finished_at=finished_at,
+                exit_code=exit_code,
+                log_file=log_file,
+            )
             result = "failed"
         jobs[idx] = updated
         jobs = _update_dependents(jobs, parent_id=job_id, parent_result=result)
@@ -416,6 +448,8 @@ def mark_finished(job_id: str, finished_at: str, exit_code: int, log_file: str |
 
 
 def format_job_summary(job: dict) -> str:
+    session_id = job.get("session_id")
+    session_suffix = f":{session_id[:12]}" if session_id else ""
     lines = [
         f"id:            {job['id']}",
         f"title:         {job.get('title', '-')}",
@@ -426,7 +460,7 @@ def format_job_summary(job: dict) -> str:
         f"updated_at:    {iso_to_display(job.get('updated_at'), with_seconds=True)}",
         f"last_started:  {iso_to_display(job.get('last_started_at'), with_seconds=True)}",
         f"last_run_at:   {iso_to_display(job.get('last_run_at'), with_seconds=True)}",
-        f"session:       {job.get('session_mode', '-')}{':' + job['session_id'][:12] if job.get('session_id') else ''}",
+        f"session:       {job.get('session_mode', '-')}{session_suffix}",
         f"dependency:    {job.get('depends_on', '-')}",
         f"at_job_id:     {job.get('at_job_id') or '-'}",
         f"log_dir:       {job.get('log_dir', '-')}",
@@ -435,7 +469,8 @@ def format_job_summary(job: dict) -> str:
         f"cwd:           {job.get('cwd', '-')}",
     ]
     if job.get("scheduler_run_at"):
-        lines.insert(4, f"atq_run_at:     {iso_to_display(job.get('scheduler_run_at'), with_seconds=True)}")
+        atq_run_at = iso_to_display(job.get("scheduler_run_at"), with_seconds=True)
+        lines.insert(4, f"atq_run_at:     {atq_run_at}")
     if job.get("drift_reason"):
         lines.append(f"drift_reason:   {job['drift_reason']}")
     if job.get("_invalid"):

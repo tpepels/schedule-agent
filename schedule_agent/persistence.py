@@ -8,7 +8,6 @@ from .scheduler_backend import normalize_legacy_when, query_atq
 from .state_model import check_invariants
 from .time_utils import now_iso, title_from_prompt
 
-
 APP_NAME = "schedule-agent"
 
 
@@ -63,7 +62,9 @@ _STATUS_MAP = {
 }
 
 
-def migrate_job(job: dict, legacy_state: dict | None = None, atq_entries: dict[str, object] | None = None) -> dict:
+def migrate_job(
+    job: dict, legacy_state: dict | None = None, atq_entries: dict[str, object] | None = None
+) -> dict:
     if "scheduled_for" in job and "title" in job and "log_dir" in job:
         return job
 
@@ -82,14 +83,20 @@ def migrate_job(job: dict, legacy_state: dict | None = None, atq_entries: dict[s
         at_job_id = (legacy_state or {}).get("at_job_id")
     migrated["at_job_id"] = at_job_id
 
-    migrated["readiness"] = migrated.get("readiness") or ("waiting_dependency" if migrated.get("depends_on") else "ready")
+    migrated["readiness"] = migrated.get("readiness") or (
+        "waiting_dependency" if migrated.get("depends_on") else "ready"
+    )
     migrated["created_at"] = migrated.get("created_at") or now_iso()
-    migrated["updated_at"] = migrated.get("updated_at") or (legacy_state or {}).get("updated_at") or now_iso()
+    migrated["updated_at"] = (
+        migrated.get("updated_at") or (legacy_state or {}).get("updated_at") or now_iso()
+    )
     migrated["last_started_at"] = migrated.get("last_started_at")
     migrated["last_run_at"] = migrated.get("last_run_at") or (legacy_state or {}).get("last_run_at")
     migrated["last_exit_code"] = migrated.get("last_exit_code")
 
-    migrated["title"] = migrated.get("title") or _legacy_prompt_title(migrated.get("prompt_file", ""))
+    migrated["title"] = migrated.get("title") or _legacy_prompt_title(
+        migrated.get("prompt_file", "")
+    )
     migrated["log_dir"] = migrated.get("log_dir") or job_log_dir(migrated["id"])
     if not migrated.get("last_log_file"):
         legacy_log = migrated.get("log")
@@ -126,7 +133,10 @@ def load_jobs() -> list[dict]:
     at_job_ids = [
         str((job.get("at_job_id") or legacy.get(job.get("id"), {}).get("at_job_id")))
         for job in raw_jobs
-        if (job.get("scheduled_for") is None and (job.get("at_job_id") or legacy.get(job.get("id"), {}).get("at_job_id")))
+        if (
+            job.get("scheduled_for") is None
+            and (job.get("at_job_id") or legacy.get(job.get("id"), {}).get("at_job_id"))
+        )
     ]
     atq_entries, _ = query_atq(at_job_ids or None) if at_job_ids else ({}, None)
 

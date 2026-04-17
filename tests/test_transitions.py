@@ -25,7 +25,9 @@ def test_make_job_sets_new_fields(app_modules):
 
 
 def test_on_submit_updates_at_job_id_and_time(app_modules):
-    updated = app_modules.transitions.on_submit(_base_job(app_modules), "42", scheduled_for="2026-04-18T09:05:00+0100")
+    updated = app_modules.transitions.on_submit(
+        _base_job(app_modules), "42", scheduled_for="2026-04-18T09:05:00+0100"
+    )
     assert updated["submission"] == "scheduled"
     assert updated["at_job_id"] == "42"
     assert updated["scheduled_for"] == "2026-04-18T09:05:00+0100"
@@ -51,8 +53,12 @@ def test_success_and_failure_record_exit_code(app_modules):
         started_at="2026-04-18T09:00:00+0100",
         log_file="/tmp/project/logs/job1/run.log",
     )
-    done = app_modules.transitions.on_success(running, "2026-04-18T09:10:00+0100", 0, log_file="/tmp/project/logs/job1/run.log")
-    failed = app_modules.transitions.on_failure(running, "2026-04-18T09:10:00+0100", 23, log_file="/tmp/project/logs/job1/run.log")
+    done = app_modules.transitions.on_success(
+        running, "2026-04-18T09:10:00+0100", 0, log_file="/tmp/project/logs/job1/run.log"
+    )
+    failed = app_modules.transitions.on_failure(
+        running, "2026-04-18T09:10:00+0100", 23, log_file="/tmp/project/logs/job1/run.log"
+    )
     assert done["execution"] == "success"
     assert done["last_exit_code"] == 0
     assert failed["execution"] == "failed"
@@ -61,7 +67,9 @@ def test_success_and_failure_record_exit_code(app_modules):
 
 def test_reschedule_and_retry_reset_terminal_state(app_modules):
     scheduled = app_modules.transitions.on_submit(_base_job(app_modules), "42")
-    running = app_modules.transitions.on_start(scheduled, "2026-04-18T09:00:00+0100", "/tmp/project/logs/job1/run.log")
+    running = app_modules.transitions.on_start(
+        scheduled, "2026-04-18T09:00:00+0100", "/tmp/project/logs/job1/run.log"
+    )
     completed = app_modules.transitions.on_success(running, "2026-04-18T09:10:00+0100", 0)
 
     rescheduled = app_modules.transitions.on_reschedule(completed, "2026-04-19T09:00:00+0100")

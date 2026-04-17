@@ -17,7 +17,6 @@ from .operations import (
     change_session,
     create_job,
     delete_job,
-    edit_prompt_contents,
     format_job_summary,
     get_job_view,
     list_job_views,
@@ -32,18 +31,18 @@ from .persistence import (
     _ensure_dirs,
     _state_home,
     find_job,
-    job_log_dir,
     load_jobs,
     load_legacy_state,
     save_jobs,
     save_legacy_state,
     update_job_in_list,
+)
+from .persistence import (
     write_prompt_file as _write_prompt_file,
 )
-from .scheduler_backend import build_script, parse_at_job_id, query_atq, remove_at_job, submit_job
-from .time_utils import iso_to_display, now_iso, title_from_prompt
+from .scheduler_backend import remove_at_job, submit_job
+from .time_utils import iso_to_display, now_iso
 from .transitions import on_cancel
-
 
 APP_NAME = "schedule-agent"
 
@@ -75,7 +74,12 @@ def _require_prompt_toolkit():
         from prompt_toolkit.layout import Layout
         from prompt_toolkit.layout.containers import HSplit, VSplit, Window
         from prompt_toolkit.layout.controls import FormattedTextControl
-        from prompt_toolkit.shortcuts import input_dialog, message_dialog, radiolist_dialog, yes_no_dialog
+        from prompt_toolkit.shortcuts import (
+            input_dialog,
+            message_dialog,
+            radiolist_dialog,
+            yes_no_dialog,
+        )
         from prompt_toolkit.styles import Style
     except ModuleNotFoundError as exc:
         raise OperationError(
@@ -310,7 +314,9 @@ def choose_session(agent: str, cwd: Path | None = None) -> str | None:
     if not sessions:
         return None
 
-    labels = ["New session"] + [f"{(session.title or '[no title]')} [{session.id[:8]}]" for session in sessions]
+    labels = ["New session"] + [
+        f"{(session.title or '[no title]')} [{session.id[:8]}]" for session in sessions
+    ]
     selected = choose("Session", labels, default="New session")
     if selected == "New session":
         return None
@@ -610,11 +616,13 @@ def jobs_menu() -> int:
 
     def header_text():
         timezone = datetime.now().astimezone().tzname() or "local"
-        return [("class:header", f" Scheduled Jobs   Filter: {state['filter'].title()}   TZ: {timezone} ")]
+        text = f" Scheduled Jobs   Filter: {state['filter'].title()}   TZ: {timezone} "
+        return [("class:header", text)]
 
     def table_text():
         jobs = current_jobs()
-        lines: list[tuple[str, str]] = [("class:table-header", "Title | Status | Scheduler | Run At | Updated | Created | Session | Dependency\n")]
+        header = "Title | Status | Scheduler | Run At | Updated | Created | Session | Dependency\n"
+        lines: list[tuple[str, str]] = [("class:table-header", header)]
         if not jobs:
             lines.append(("class:muted", "No jobs.\n"))
             return lines
@@ -635,7 +643,10 @@ def jobs_menu() -> int:
         return [("", format_job_summary(job) + "\n")]
 
     def footer_text():
-        help_text = " n new  e edit prompt  t reschedule  c session  u unschedule  s submit/repair  r retry  d delete  f filter  g refresh  q quit "
+        help_text = (
+            " n new  e edit prompt  t reschedule  c session  u unschedule"
+            "  s submit/repair  r retry  d delete  f filter  g refresh  q quit "
+        )
         message = state["message"]
         if message:
             return [("class:footer", help_text + "\n"), ("class:message", message)]
@@ -684,6 +695,7 @@ def jobs_menu() -> int:
     def _new(event):
         def action():
             create_job_interactive()
+
         run_action(action)
 
     @kb.add("e")
@@ -697,6 +709,7 @@ def jobs_menu() -> int:
             edit_file(path)
             refresh_prompt(job["id"])
             state["message"] = f"Prompt updated for {job['id']}."
+
         run_action(action)
 
     @kb.add("t")
@@ -708,7 +721,9 @@ def jobs_menu() -> int:
         def action():
             schedule_spec = prompt_text("New run time", default="now + 5 minutes")
             updated = reschedule_job(job["id"], schedule_spec)
-            state["message"] = f"Rescheduled for {iso_to_display(updated['scheduled_for'], with_seconds=True)}."
+            run_at = iso_to_display(updated["scheduled_for"], with_seconds=True)
+            state["message"] = f"Rescheduled for {run_at}."
+
         run_action(action)
 
     @kb.add("c")
@@ -722,6 +737,7 @@ def jobs_menu() -> int:
             updated = change_session(job["id"], session_id)
             label = updated["session_id"][:12] if updated["session_id"] else "new"
             state["message"] = f"Session set to {label}."
+
         run_action(action)
 
     @kb.add("u")
@@ -733,6 +749,7 @@ def jobs_menu() -> int:
         def action():
             unschedule_job(job["id"])
             state["message"] = f"Removed {job['id']} from queue."
+
         run_action(action)
 
     @kb.add("s")
@@ -744,6 +761,7 @@ def jobs_menu() -> int:
         def action():
             updated = submit_or_repair_job(job["id"])
             state["message"] = f"Queued in at as {updated['at_job_id']}."
+
         run_action(action)
 
     @kb.add("r")
@@ -755,7 +773,9 @@ def jobs_menu() -> int:
         def action():
             schedule_spec = prompt_text("Retry run time", default="now + 5 minutes")
             updated = retry_job(job["id"], schedule_spec)
-            state["message"] = f"Retry scheduled for {iso_to_display(updated['scheduled_for'], with_seconds=True)}."
+            run_at = iso_to_display(updated["scheduled_for"], with_seconds=True)
+            state["message"] = f"Retry scheduled for {run_at}."
+
         run_action(action)
 
     @kb.add("d")
@@ -768,6 +788,7 @@ def jobs_menu() -> int:
             if confirm(f"Delete {job['id']} permanently?", default=False):
                 delete_job(job["id"])
                 state["message"] = f"Deleted {job['id']}."
+
         run_action(action)
 
     root = HSplit(
@@ -801,7 +822,10 @@ def jobs_menu() -> int:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog=APP_NAME, description="Schedule Codex and Claude CLI jobs.")
+    parser = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description="Schedule Codex and Claude CLI jobs.",
+    )
     sub = parser.add_subparsers(dest="command")
 
     list_p = sub.add_parser("list", help="List jobs.")
@@ -813,13 +837,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     del_p = sub.add_parser("delete", help="Delete one job permanently.")
     del_p.add_argument("job_id")
 
-    unschedule_p = sub.add_parser("unschedule", help="Remove a job from the at queue without deleting it.")
+    unschedule_p = sub.add_parser(
+        "unschedule",
+        help="Remove a job from the at queue without deleting it.",
+    )
     unschedule_p.add_argument("job_id")
 
     cancel_p = sub.add_parser("cancel", help=argparse.SUPPRESS)
     cancel_p.add_argument("job_id")
 
-    edit_p = sub.add_parser("edit-prompt", help="Edit a job prompt and re-sync the scheduler if needed.")
+    edit_p = sub.add_parser(
+        "edit-prompt",
+        help="Edit a job prompt and re-sync the scheduler if needed.",
+    )
     edit_p.add_argument("job_id")
 
     res_p = sub.add_parser("reschedule", help="Reschedule one job.")
@@ -897,11 +927,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cli_submit_job(args.job_id)
         if args.command == "mark":
             if args.mark_state == "running":
-                return cli_mark_running(args.job_id, started_at=args.started_at, log_file=args.log_file)
+                return cli_mark_running(
+                    args.job_id,
+                    started_at=args.started_at,
+                    log_file=args.log_file,
+                )
             if args.mark_state == "done":
-                return cli_mark_done(args.job_id, finished_at=args.finished_at, exit_code=args.exit_code, log_file=args.log_file)
+                return cli_mark_done(
+                    args.job_id,
+                    finished_at=args.finished_at,
+                    exit_code=args.exit_code,
+                    log_file=args.log_file,
+                )
             if args.mark_state == "failed":
-                return cli_mark_failed(args.job_id, finished_at=args.finished_at, exit_code=args.exit_code, log_file=args.log_file)
+                return cli_mark_failed(
+                    args.job_id,
+                    finished_at=args.finished_at,
+                    exit_code=args.exit_code,
+                    log_file=args.log_file,
+                )
             parser.error("mark requires a state: running, done, or failed")
 
         return jobs_menu()

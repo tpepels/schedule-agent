@@ -1,4 +1,4 @@
-from pathlib import Path
+import pytest
 
 
 def _write_job(app_modules, **overrides):
@@ -20,7 +20,7 @@ def _write_job(app_modules, **overrides):
 
 def test_list_job_views_reports_missing_and_drifted_scheduler_states(app_modules, monkeypatch):
     operations = app_modules.operations
-    scheduled = _write_job(app_modules, submission="scheduled", at_job_id="42")
+    _write_job(app_modules, submission="scheduled", at_job_id="42")
 
     monkeypatch.setattr(
         operations,
@@ -47,7 +47,9 @@ def test_reschedule_of_scheduled_job_removes_old_at_job_and_resubmits(app_module
     removed = []
     submitted = []
 
-    monkeypatch.setattr(operations, "remove_at_job", lambda at_job_id: (removed.append(at_job_id) or True, ""))
+    monkeypatch.setattr(
+        operations, "remove_at_job", lambda at_job_id: (removed.append(at_job_id) or True, "")
+    )
     monkeypatch.setattr(operations, "query_atq_entry", lambda at_job_id: (None, None))
 
     def fake_submit(job):
@@ -55,7 +57,9 @@ def test_reschedule_of_scheduled_job_removes_old_at_job_and_resubmits(app_module
         return "99", "job 99 at Fri Apr 18 10:00:00 2026"
 
     monkeypatch.setattr(operations, "submit_job", fake_submit)
-    monkeypatch.setattr(operations, "resolve_schedule_spec", lambda spec: "2026-04-18T10:00:00+0100")
+    monkeypatch.setattr(
+        operations, "resolve_schedule_spec", lambda spec: "2026-04-18T10:00:00+0100"
+    )
 
     updated = operations.reschedule_job("job1", "now + 1 hour")
     assert removed == ["42"]
@@ -64,7 +68,66 @@ def test_reschedule_of_scheduled_job_removes_old_at_job_and_resubmits(app_module
     assert updated["at_job_id"] == "99"
 
 
-def test_refresh_prompt_updates_title_and_resubmits_when_scheduled(app_modules, monkeypatch, tmp_path):
+def test_submit_or_repair_replaces_stale_scheduler_membership(app_modules, monkeypatch):
+    operations = app_modules.operations
+    _write_job(app_modules, submission="scheduled", at_job_id="42")
+
+    removed = []
+    submitted = []
+
+    monkeypatch.setattr(
+        operations,
+        "remove_at_job",
+        lambda at_job_id: (removed.append(at_job_id) or False, "atrm: job 42 not found"),
+    )
+
+    def fake_query(at_job_id):
+        if at_job_id == "42":
+            return None, None
+        return type("Entry", (), {"scheduled_for": "2026-04-18T09:10:00+0100"})(), None
+
+    monkeypatch.setattr(operations, "query_atq_entry", fake_query)
+
+    def fake_submit(job):
+        submitted.append((job["submission"], job["scheduled_for"], job["at_job_id"]))
+        return "99", "job 99 at Fri Apr 18 09:10:00 2026"
+
+    monkeypatch.setattr(operations, "submit_job", fake_submit)
+
+    updated = operations.submit_or_repair_job("job1")
+    assert removed == ["42"]
+    assert submitted == [("queued", "2026-04-18T09:00:00+0100", None)]
+    assert updated["submission"] == "scheduled"
+    assert updated["at_job_id"] == "99"
+    assert updated["scheduled_for"] == "2026-04-18T09:10:00+0100"
+
+
+def test_reschedule_job_leaves_unscheduled_job_when_resubmit_fails(app_modules, monkeypatch):
+    operations = app_modules.operations
+    _write_job(app_modules, submission="scheduled", at_job_id="42")
+
+    monkeypatch.setattr(operations, "remove_at_job", lambda at_job_id: (True, ""))
+    monkeypatch.setattr(
+        operations, "resolve_schedule_spec", lambda spec: "2026-04-18T10:00:00+0100"
+    )
+    monkeypatch.setattr(
+        operations,
+        "submit_job",
+        lambda job: (_ for _ in ()).throw(RuntimeError("at unavailable")),
+    )
+
+    with pytest.raises(operations.OperationError, match="at unavailable"):
+        operations.reschedule_job("job1", "now + 1 hour")
+
+    jobs = app_modules.persistence.load_jobs()
+    assert jobs[0]["submission"] == "queued"
+    assert jobs[0]["at_job_id"] is None
+    assert jobs[0]["scheduled_for"] == "2026-04-18T10:00:00+0100"
+
+
+def test_refresh_prompt_updates_title_and_resubmits_when_scheduled(
+    app_modules, monkeypatch, tmp_path
+):
     operations = app_modules.operations
     prompt_path = tmp_path / "prompt.md"
     prompt_path.write_text("New prompt title\n\nbody", encoding="utf-8")
@@ -72,7 +135,9 @@ def test_refresh_prompt_updates_title_and_resubmits_when_scheduled(app_modules, 
 
     monkeypatch.setattr(operations, "remove_at_job", lambda at_job_id: (True, ""))
     monkeypatch.setattr(operations, "query_atq_entry", lambda at_job_id: (None, None))
-    monkeypatch.setattr(operations, "submit_job", lambda job: ("77", "job 77 at Fri Apr 18 09:00:00 2026"))
+    monkeypatch.setattr(
+        operations, "submit_job", lambda job: ("77", "job 77 at Fri Apr 18 09:00:00 2026")
+    )
 
     updated = operations.refresh_prompt("job1")
     assert updated["title"] == "New prompt title"
@@ -111,7 +176,9 @@ def test_mark_finished_updates_dependents(app_modules):
         cwd="/tmp/project",
         log_dir="/tmp/project/logs/parent",
     )
-    parent = app_modules.transitions.on_start(parent, "2026-04-18T09:00:00+0100", "/tmp/project/logs/parent/run.log")
+    parent = app_modules.transitions.on_start(
+        parent, "2026-04-18T09:00:00+0100", "/tmp/project/logs/parent/run.log"
+    )
     child = app_modules.transitions.make_job(
         job_id="child",
         title="Child",
@@ -126,10 +193,56 @@ def test_mark_finished_updates_dependents(app_modules):
     )
     app_modules.persistence.save_jobs([parent, child])
 
-    operations.mark_finished("parent", finished_at="2026-04-18T09:05:00+0100", exit_code=0, log_file="/tmp/project/logs/parent/run.log")
+    operations.mark_finished(
+        "parent",
+        finished_at="2026-04-18T09:05:00+0100",
+        exit_code=0,
+        log_file="/tmp/project/logs/parent/run.log",
+    )
     jobs = app_modules.persistence.load_jobs()
     child = next(job for job in jobs if job["id"] == "child")
     assert child["readiness"] == "ready"
+
+
+def test_mark_finished_failure_blocks_dependents(app_modules):
+    operations = app_modules.operations
+    parent = app_modules.transitions.make_job(
+        job_id="parent",
+        title="Parent",
+        agent="claude",
+        session_mode="new",
+        session_id=None,
+        prompt_file="/tmp/parent.md",
+        scheduled_for="2026-04-18T09:00:00+0100",
+        cwd="/tmp/project",
+        log_dir="/tmp/project/logs/parent",
+    )
+    parent = app_modules.transitions.on_start(
+        parent, "2026-04-18T09:00:00+0100", "/tmp/project/logs/parent/run.log"
+    )
+    child = app_modules.transitions.make_job(
+        job_id="child",
+        title="Child",
+        agent="claude",
+        session_mode="new",
+        session_id=None,
+        prompt_file="/tmp/child.md",
+        scheduled_for="2026-04-18T10:00:00+0100",
+        cwd="/tmp/project",
+        log_dir="/tmp/project/logs/child",
+        depends_on="parent",
+    )
+    app_modules.persistence.save_jobs([parent, child])
+
+    operations.mark_finished(
+        "parent",
+        finished_at="2026-04-18T09:05:00+0100",
+        exit_code=17,
+        log_file="/tmp/project/logs/parent/run.log",
+    )
+    jobs = app_modules.persistence.load_jobs()
+    child = next(job for job in jobs if job["id"] == "child")
+    assert child["readiness"] == "blocked"
 
 
 def test_delete_job_removes_prompt_and_log_dir(app_modules, tmp_path, monkeypatch):

@@ -1,5 +1,3 @@
-import pytest
-
 from schedule_agent.execution import AGENTS, build_agent_cmd
 
 
@@ -20,12 +18,13 @@ def _job(agent, prompt_file="/tmp/p.md", session_mode="new", session_id=None, **
 # Codex
 # ---------------------------------------------------------------------------
 
+
 def test_codex_new_session():
     cmd = build_agent_cmd(_job("codex"))
     assert "codex" in cmd
     assert "exec" in cmd
     assert "--dangerously-bypass-approvals-and-sandbox" in cmd
-    assert '$(cat /tmp/p.md)' in cmd
+    assert "$(cat /tmp/p.md)" in cmd
     assert "< /dev/null" in cmd
     assert "resume" not in cmd
 
@@ -35,7 +34,7 @@ def test_codex_resume_session():
     assert "codex" in cmd
     assert "exec resume" in cmd
     assert "sess-123" in cmd
-    assert '$(cat /tmp/p.md)' in cmd
+    assert "$(cat /tmp/p.md)" in cmd
     assert "< /dev/null" in cmd
 
 
@@ -43,12 +42,13 @@ def test_codex_resume_session():
 # Claude
 # ---------------------------------------------------------------------------
 
+
 def test_claude_new_session():
     cmd = build_agent_cmd(_job("claude"))
     assert "claude" in cmd
     assert "-p" in cmd
     assert "--dangerously-skip-permissions" in cmd
-    assert '$(cat /tmp/p.md)' in cmd
+    assert "$(cat /tmp/p.md)" in cmd
     assert "< /dev/null" in cmd
     assert "--resume" not in cmd
 
@@ -60,13 +60,14 @@ def test_claude_resume_session():
     assert "sess-999" in cmd
     assert "-p" in cmd
     assert "--dangerously-skip-permissions" in cmd
-    assert '$(cat /tmp/p.md)' in cmd
+    assert "$(cat /tmp/p.md)" in cmd
     assert "< /dev/null" in cmd
 
 
 # ---------------------------------------------------------------------------
 # Legacy model compatibility (job with "session" field instead of session_mode/session_id)
 # ---------------------------------------------------------------------------
+
 
 def test_legacy_session_field_codex_resume():
     job = {
@@ -95,6 +96,7 @@ def test_legacy_no_session_field():
 # ---------------------------------------------------------------------------
 # Path quoting
 # ---------------------------------------------------------------------------
+
 
 def test_prompt_path_with_spaces_is_quoted():
     cmd = build_agent_cmd(_job("claude", prompt_file="/tmp/my prompt/p.md"))
