@@ -48,8 +48,7 @@ def test_normalize_legacy_timestamp_and_title_from_prompt():
         == "2026-04-18T09:00:00+0000"
     )
     assert (
-        time_utils.normalize_legacy_timestamp("2026-04-18 09:00:00")
-        == "2026-04-18T09:00:00+0000"
+        time_utils.normalize_legacy_timestamp("2026-04-18 09:00:00") == "2026-04-18T09:00:00+0000"
     )
     with pytest.raises(ValueError):
         time_utils.normalize_legacy_timestamp("18/04/2026 09:00")

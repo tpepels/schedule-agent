@@ -59,8 +59,10 @@ def test_create_job_persists_unsent_job_with_derived_title_and_prompt_file(
     assert job["scheduled_for"] == "2026-04-18T11:30:00+0000"
     assert job["id"].startswith("claude-20260417T100000")
     assert app_modules.persistence.load_jobs()[0]["id"] == job["id"]
-    assert app_modules.persistence.Path(job["prompt_file"]).read_text(encoding="utf-8").startswith(
-        "\n  Release checklist"
+    assert (
+        app_modules.persistence.Path(job["prompt_file"])
+        .read_text(encoding="utf-8")
+        .startswith("\n  Release checklist")
     )
 
 

@@ -73,9 +73,7 @@ def test_choose_session_prefers_current_claude_project(app_modules, monkeypatch,
     cli = app_modules.cli
     monkeypatch.setenv("HOME", str(tmp_path))
     cwd = Path("/work/current/project")
-    preferred_dir = (
-        tmp_path / ".claude" / "projects" / cwd.as_posix().replace("/", "-")
-    )
+    preferred_dir = tmp_path / ".claude" / "projects" / cwd.as_posix().replace("/", "-")
     other_dir = tmp_path / ".claude" / "projects" / "other-project"
 
     preferred = preferred_dir / "preferred.jsonl"
@@ -207,8 +205,7 @@ def test_list_jobs_noninteractive_appends_atq_warning(app_modules, monkeypatch):
     output = cli.list_jobs_noninteractive()
 
     assert (
-        "Title | Status | Scheduler | Run At | Updated | Created | Session | Dependency"
-        in output
+        "Title | Status | Scheduler | Run At | Updated | Created | Session | Dependency" in output
     )
     assert output.endswith("atq warning: atq unavailable")
 
