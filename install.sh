@@ -87,19 +87,21 @@ mkdir -p "$APP_DIR"
 
 # Copy project files
 cp -r schedule_agent "$APP_DIR/"
-cp pyproject.toml "$APP_DIR/" 2>/dev/null || true
+cp pyproject.toml "$APP_DIR/"
+cp README.md "$APP_DIR/" 2>/dev/null || true
+cp LICENSE "$APP_DIR/" 2>/dev/null || true
 
 # Create venv
 "$PYTHON_BIN" -m venv "$VENV_DIR"
 
-# Install dependencies
+# Install package into the venv
 "$VENV_DIR/bin/pip" install --upgrade pip
-"$VENV_DIR/bin/pip" install prompt_toolkit
+"$VENV_DIR/bin/pip" install "$APP_DIR"
 
 # Create launcher
 cat > "$BIN_DIR/schedule-agent" <<EOF
 #!/usr/bin/env bash
-exec "$VENV_DIR/bin/python" -m schedule_agent.cli "\$@"
+exec "$VENV_DIR/bin/schedule-agent" "\$@"
 EOF
 
 chmod +x "$BIN_DIR/schedule-agent"

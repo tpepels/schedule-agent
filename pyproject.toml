@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "schedule-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "Schedule Codex and Claude CLI jobs with a prompt_toolkit terminal UI."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,6 +23,12 @@ classifiers = [
   "Operating System :: POSIX :: Linux",
 ]
 
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.11.0",
+]
+
 [project.scripts]
 schedule-agent = "schedule_agent.cli:main"
 
@@ -32,3 +38,10 @@ package-dir = {"" = "."}
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["schedule_agent*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

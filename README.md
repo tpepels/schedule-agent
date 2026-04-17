@@ -176,6 +176,30 @@ schedule-agent --dry-run
 
 ---
 
+## Development
+
+Install the local quality tooling:
+
+```bash
+python3 -m pip install -e ".[dev]"
+```
+
+Run the same mandatory checks that CI runs:
+
+```bash
+make check
+```
+
+The enforced gate is:
+
+* `ruff check .`
+* `ruff format --check .`
+* `pytest -q`
+
+If you want GitHub to block merges on failures, mark the `quality` workflow as a required status check in branch protection.
+
+---
+
 ## Remarks
 
 ### Agent permissions
