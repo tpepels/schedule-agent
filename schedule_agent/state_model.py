@@ -93,7 +93,9 @@ def check_invariants(job: dict) -> None:
         try:
             parse_iso_datetime(scheduled_for)
         except ValueError:
-            errors.append(f"Invariant 9: scheduled_for is not a valid ISO datetime: {scheduled_for!r}")
+            errors.append(
+                f"Invariant 9: scheduled_for is not a valid ISO datetime: {scheduled_for!r}"
+            )
     if not job.get("title"):
         errors.append("Invariant 10: title is required")
     if not job.get("log_dir"):
