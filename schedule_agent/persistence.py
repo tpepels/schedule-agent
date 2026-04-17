@@ -4,9 +4,10 @@ import json
 import os
 from pathlib import Path
 
-from .scheduler_backend import normalize_legacy_when, query_atq
+from .legacy import compat as legacy_compat
+from .scheduler_backend import query_atq
 from .state_model import check_invariants
-from .time_utils import normalize_legacy_timestamp, now_iso, title_from_prompt
+from .time_utils import now_iso
 
 APP_NAME = "schedule-agent"
 
@@ -37,7 +38,9 @@ def _queue_file() -> Path:
 
 
 def _legacy_state_file() -> Path:
-    return _state_home() / "agent_queue_state.json"
+    """Deprecated compatibility wrapper. See `schedule_agent.legacy.compat`."""
+
+    return legacy_compat.legacy_state_file(_state_home())
 
 
 def job_log_dir(job_id: str) -> str:
@@ -45,81 +48,18 @@ def job_log_dir(job_id: str) -> str:
     return str(_state_home() / "logs" / job_id)
 
 
-def _legacy_prompt_title(prompt_file: str) -> str:
-    try:
-        return title_from_prompt(Path(prompt_file).read_text(encoding="utf-8"))
-    except Exception:
-        return "(untitled job)"
-
-
-_STATUS_MAP = {
-    "queued": ("queued", "pending"),
-    "submitted": ("scheduled", "pending"),
-    "running": ("running", "running"),
-    "success": ("queued", "success"),
-    "failed": ("queued", "failed"),
-    "cancelled": ("cancelled", "pending"),
-}
-
-
 def migrate_job(
     job: dict, legacy_state: dict | None = None, atq_entries: dict[str, object] | None = None
 ) -> dict:
-    if "scheduled_for" in job and "title" in job and "log_dir" in job:
-        return job
+    """Deprecated compatibility wrapper. See `schedule_agent.legacy.compat`."""
 
-    migrated = dict(job)
-    old_session = migrated.pop("session", None)
-    migrated["session_mode"] = migrated.get("session_mode") or ("resume" if old_session else "new")
-    migrated["session_id"] = migrated.get("session_id", old_session)
-
-    old_status = (legacy_state or {}).get("status", "queued")
-    submission, execution = _STATUS_MAP.get(old_status, ("queued", "pending"))
-    migrated["submission"] = migrated.get("submission", submission)
-    migrated["execution"] = migrated.get("execution", execution)
-
-    at_job_id = migrated.get("at_job_id")
-    if not at_job_id and migrated["submission"] == "scheduled":
-        at_job_id = (legacy_state or {}).get("at_job_id")
-    migrated["at_job_id"] = at_job_id
-
-    migrated["readiness"] = migrated.get("readiness") or (
-        "waiting_dependency" if migrated.get("depends_on") else "ready"
+    return legacy_compat.migrate_job(
+        job,
+        legacy_state,
+        atq_entries,
+        job_log_dir=job_log_dir,
+        now_iso=now_iso,
     )
-    migrated["created_at"] = normalize_legacy_timestamp(migrated.get("created_at")) or now_iso()
-    migrated["updated_at"] = (
-        normalize_legacy_timestamp(
-            migrated.get("updated_at") or (legacy_state or {}).get("updated_at")
-        )
-        or now_iso()
-    )
-    migrated["last_started_at"] = normalize_legacy_timestamp(migrated.get("last_started_at"))
-    migrated["last_run_at"] = normalize_legacy_timestamp(
-        migrated.get("last_run_at") or (legacy_state or {}).get("last_run_at")
-    )
-    migrated["last_exit_code"] = migrated.get("last_exit_code")
-
-    migrated["title"] = migrated.get("title") or _legacy_prompt_title(
-        migrated.get("prompt_file", "")
-    )
-    migrated["log_dir"] = migrated.get("log_dir") or job_log_dir(migrated["id"])
-    if not migrated.get("last_log_file"):
-        legacy_log = migrated.get("log")
-        migrated["last_log_file"] = legacy_log if legacy_log and Path(legacy_log).exists() else None
-
-    scheduled_for = migrated.get("scheduled_for")
-    if not scheduled_for and at_job_id and atq_entries:
-        entry = atq_entries.get(str(at_job_id))
-        if entry:
-            scheduled_for = entry.scheduled_for
-    if not scheduled_for:
-        scheduled_for = normalize_legacy_when(migrated.get("when"))
-    if not scheduled_for:
-        raise ValueError("Could not resolve legacy schedule into scheduled_for")
-    migrated["scheduled_for"] = scheduled_for
-    migrated.pop("when", None)
-
-    return migrated
 
 
 def load_jobs() -> list[dict]:
@@ -134,7 +74,7 @@ def load_jobs() -> list[dict]:
         if line.strip()
     ]
 
-    legacy = load_legacy_state()
+    legacy = legacy_compat.load_legacy_state(_ensure_dirs, _state_home())
     at_job_ids = [
         str((job.get("at_job_id") or legacy.get(job.get("id"), {}).get("at_job_id")))
         for job in raw_jobs
@@ -148,7 +88,13 @@ def load_jobs() -> list[dict]:
     results = []
     for job in raw_jobs:
         try:
-            migrated = migrate_job(job, legacy.get(job.get("id")), atq_entries)
+            migrated = legacy_compat.migrate_job(
+                job,
+                legacy.get(job.get("id")),
+                atq_entries,
+                job_log_dir=job_log_dir,
+                now_iso=now_iso,
+            )
             check_invariants(migrated)
             results.append(migrated)
         except Exception as exc:
@@ -184,19 +130,12 @@ def write_prompt_file(prompt_dir: Path, job_id: str, prompt: str) -> str:
 
 
 def load_legacy_state() -> dict:
-    _ensure_dirs()
-    legacy_file = _legacy_state_file()
-    if not legacy_file.exists():
-        return {}
-    try:
-        return json.loads(legacy_file.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    """Deprecated compatibility wrapper. See `schedule_agent.legacy.compat`."""
+
+    return legacy_compat.load_legacy_state(_ensure_dirs, _state_home())
 
 
 def save_legacy_state(state: dict) -> None:
-    _ensure_dirs()
-    _legacy_state_file().write_text(
-        json.dumps(state, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    """Deprecated compatibility wrapper. See `schedule_agent.legacy.compat`."""
+
+    legacy_compat.save_legacy_state(_ensure_dirs, _state_home(), state)

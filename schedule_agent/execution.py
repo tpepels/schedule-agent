@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import shlex
 
+from .legacy.compat import resolve_session_id
+
 AGENTS: dict[str, dict] = {
     "codex": {
         "label": "Codex",
@@ -19,15 +21,14 @@ AGENTS: dict[str, dict] = {
 def build_agent_cmd(job: dict) -> str:
     """Build the shell command to invoke the agent for this job.
 
-    Supports both the new model (session_mode/session_id) and the legacy
-    model (session field) so it works transparently during migration.
+    Deprecated compatibility with the old `session` field is isolated under
+    `schedule_agent.legacy`.
     """
     cfg = AGENTS[job["agent"]]
     prompt_path = shlex.quote(job["prompt_file"])
     base = " ".join(cfg["base_args"])
 
-    # Support both new model and legacy model
-    session_id = job.get("session_id") or job.get("session")
+    session_id = resolve_session_id(job)
     session_mode = job.get("session_mode", "resume" if session_id else "new")
 
     if session_id and session_mode == "resume":

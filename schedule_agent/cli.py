@@ -5,6 +5,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,6 +13,8 @@ from pathlib import Path
 from typing import Sequence
 
 from .execution import AGENTS, build_agent_cmd
+from .legacy import cli_state as legacy_cli_state
+from .legacy.compat import legacy_state_file
 from .operations import (
     OperationError,
     change_session,
@@ -32,19 +35,22 @@ from .persistence import (
     _state_home,
     find_job,
     load_jobs,
-    load_legacy_state,
     save_jobs,
-    save_legacy_state,
-    update_job_in_list,
 )
 from .persistence import (
     write_prompt_file as _write_prompt_file,
 )
-from .scheduler_backend import remove_at_job, submit_job
-from .time_utils import iso_to_display, now_iso
+from .scheduler_backend import submit_job
+from .time_utils import iso_to_display
 from .transitions import on_cancel
 
 APP_NAME = "schedule-agent"
+
+load_state = legacy_cli_state.load_state
+save_state = legacy_cli_state.save_state
+set_state = legacy_cli_state.set_state
+clear_state = legacy_cli_state.clear_state
+cancel_at_job = legacy_cli_state.cancel_at_job
 
 
 def _state_home_fn() -> Path:
@@ -57,7 +63,7 @@ def _data_home_fn() -> Path:
 
 def _make_paths():
     state_dir, data_dir, prompt_dir, _, queue_file = _ensure_dirs()
-    return state_dir, data_dir, queue_file, state_dir / "agent_queue_state.json", prompt_dir
+    return state_dir, data_dir, queue_file, legacy_state_file(state_dir), prompt_dir
 
 
 STATE_DIR, DATA_DIR, QUEUE_FILE, STATE_FILE, PROMPT_DIR = _make_paths()
@@ -152,31 +158,6 @@ def _resolve_editor() -> list[str]:
 
 def edit_file(path: Path) -> None:
     subprocess.run([*_resolve_editor(), str(path)], check=False)
-
-
-def load_state() -> dict:
-    return load_legacy_state()
-
-
-def save_state(state: dict) -> None:
-    save_legacy_state(state)
-
-
-def set_state(job_id: str, status: str, **extra) -> None:
-    state = load_legacy_state()
-    entry = state.get(job_id, {})
-    entry["status"] = status
-    entry["updated_at"] = now_iso()
-    entry.update(extra)
-    state[job_id] = entry
-    save_legacy_state(state)
-
-
-def clear_state(job_id: str) -> None:
-    state = load_legacy_state()
-    if job_id in state:
-        del state[job_id]
-        save_legacy_state(state)
 
 
 @dataclass
@@ -342,29 +323,6 @@ def read_prompt() -> str:
 def write_prompt_file(job_id: str, prompt: str) -> str:
     _ensure_dirs()
     return _write_prompt_file(PROMPT_DIR, job_id, prompt)
-
-
-def cancel_at_job(job_id: str) -> bool:
-    jobs = load_jobs()
-    _, job = find_job(jobs, job_id)
-    if job is None or not job.get("at_job_id"):
-        return False
-    ok, err = remove_at_job(job["at_job_id"])
-    legacy = load_state()
-    entry = legacy.get(job_id, {})
-    entry["at_job_removed"] = ok
-    entry["at_job_remove_attempted_at"] = now_iso()
-    if err:
-        entry["at_job_remove_error"] = err
-    entry.pop("at_job_id", None)
-    legacy[job_id] = entry
-    save_state(legacy)
-    if ok:
-        updated = dict(job)
-        updated["at_job_id"] = None
-        jobs = update_job_in_list(jobs, updated)
-        save_jobs(jobs)
-    return ok
 
 
 def schedule(job: dict, dry_run: bool = False) -> str:
@@ -895,6 +853,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _print_deprecated_cli_surface(command: str, replacement: str) -> None:
+    print(
+        f"warning: `{command}` is deprecated and will be removed; use `{replacement}` instead.",
+        file=sys.stderr,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -910,12 +875,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "unschedule":
             return cli_unschedule_job(args.job_id)
         if args.command == "cancel":
+            _print_deprecated_cli_surface("cancel", "unschedule")
             return cli_cancel_job(args.job_id)
         if args.command == "edit-prompt":
             return cli_edit_prompt(args.job_id)
         if args.command == "reschedule":
             return cli_reschedule_job(args.job_id, args.when)
         if args.command in ("set-session", "session"):
+            if args.command == "session":
+                _print_deprecated_cli_surface("session", "set-session")
             if args.new:
                 return cli_change_session(args.job_id, None)
             if args.session is None:

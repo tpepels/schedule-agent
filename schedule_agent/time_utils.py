@@ -71,24 +71,12 @@ def sort_key_for_iso(value: str | None) -> tuple[int, float]:
         return (1, float("inf"))
 
 
-_LEGACY_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
-
-
 def normalize_legacy_timestamp(value: str | None) -> str | None:
-    """Convert a legacy non-ISO timestamp (YYYY-MM-DD HH:MM:SS) to ISO format.
+    """Deprecated compatibility wrapper. See `schedule_agent.legacy.compat`."""
 
-    Returns the value unchanged if it already parses as ISO, or None if the
-    input is empty. Raises ValueError for unrecognised formats.
-    """
-    if not value:
-        return None
-    try:
-        parse_iso_datetime(value)
-        return value
-    except ValueError:
-        pass
-    dt = datetime.strptime(value.strip(), _LEGACY_DATETIME_FORMAT)
-    return dt.astimezone().strftime(ISO_SECONDS_FORMAT)
+    from .legacy.compat import normalize_legacy_timestamp as legacy_normalize_timestamp
+
+    return legacy_normalize_timestamp(value)
 
 
 def title_from_prompt(prompt: str) -> str:

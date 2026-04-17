@@ -89,7 +89,9 @@ def test_migrate_job_maps_legacy_success_and_preserves_existing_log(
     log_file = tmp_path / "run.log"
     log_file.write_text("completed", encoding="utf-8")
     monkeypatch.setattr(
-        persistence, "normalize_legacy_when", lambda value: "2026-04-18T09:00:00+0100"
+        persistence.legacy_compat,
+        "normalize_legacy_when",
+        lambda value: "2026-04-18T09:00:00+0100",
     )
 
     job = {

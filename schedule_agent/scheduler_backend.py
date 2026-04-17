@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from .execution import build_agent_cmd
 from .time_utils import (
     iso_to_at_time,
-    normalize_schedule_input,
     parse_iso_datetime,
     resolve_schedule_input,
 )
@@ -138,9 +137,8 @@ def query_atq_entry(at_job_id: str) -> tuple[AtqEntry | None, str | None]:
 
 
 def normalize_legacy_when(value: str | None) -> str | None:
-    if not value:
-        return None
-    try:
-        return resolve_schedule_input(normalize_schedule_input(value))
-    except ValueError:
-        return None
+    """Deprecated compatibility wrapper. See `schedule_agent.legacy.compat`."""
+
+    from .legacy.compat import normalize_legacy_when as legacy_normalize_when
+
+    return legacy_normalize_when(value)
