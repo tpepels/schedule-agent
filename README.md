@@ -1,314 +1,197 @@
 # schedule-agent
 
-Queue Codex and Claude CLI work so it runs **after your session expires**.
+**Queue Codex and Claude CLI work so it runs after your session expires.**
 
 Persistent job scheduling for short-lived agent sessions.
 
 ---
 
-## What
+## The problem
 
-`schedule-agent` is a CLI tool for scheduling Codex and Claude prompts to run later.
+You're deep in a task. You fire off:
 
-It lets you:
+```bash
+claude -p "finish the migration and open a PR"
+```
 
-* queue agent work for a later time
-* persist jobs on disk
-* inspect scheduled jobs
-* safely modify jobs that were already submitted
+Then one of these happens:
 
-Jobs are executed through `at`, not interactively.
+- your session expires mid-run
+- your usage quota resets in four hours
+- a long task gets cut off
+- you want work to keep going after you close the laptop
+
+`schedule-agent` is for exactly that. Write the prompt now, let it run at 3am, come back to the result. Short-lived sessions stop forcing short-lived workflows.
 
 ---
 
-## Why
-
-You run something like:
-
-```bash
-claude -p "do X"
-```
-or:
-```bash
-codex exec "do X"
-```
-
-Then one of the usual things happens:
-
-* your session expires
-* your usage resets later
-* a long task gets interrupted
-* you need the work to continue while you are away
-
-schedule-agent exists for exactly that situation. It lets you queue work to run at a later time of your choosing, so short-lived agent sessions do not force short-lived workflows.
-
----
-
-## Install
-
-
-Clone the repository and run the install script:
+## Quick start
 
 ```bash
 git clone <repo>
 cd schedule-agent
 ./install.sh
-```
 
-The install script now handles both installation and updates:
+export PATH="$HOME/.local/bin:$PATH"   # if not already set
 
-- If schedule-agent is not installed, it will perform a fresh install.
-- If schedule-agent is already installed, it will notify you and update to the latest version (via pip if possible, or by reinstalling the local files).
-
-Make sure the install location is on your `PATH`:
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-Then run:
-
-```bash
 schedule-agent
 ```
+
+From there, the interactive TUI walks you through:
+
+1. pick agent (Codex or Claude)
+2. pick or reuse a session
+3. write your prompt
+4. choose when to run (`now + 90 minutes`, `03:00 tomorrow`, etc.)
+5. submit
+
+The install script handles both fresh installs and updates.
 
 ---
 
 ## Requirements
 
-This tool is intended for Linux users only!
+schedule-agent is **Linux / *nix only**. It leans on the system `at` scheduler — there is no Windows or macOS equivalent baked in.
 
-It depends on the system `at` scheduler, so these commands must exist:
+Minimum set:
+
+| Tool | Why |
+|------|-----|
+| Linux / *nix | relies on `at` + `atd` |
+| Python **3.10+** | runtime |
+| `at`, `atrm`, `atd` | job scheduler |
+| `claude` and/or `codex` | at least one agent CLI |
+| `nano` / `nvim` / `code --wait` / any `$EDITOR` | for writing prompts |
+
+Verify before installing:
 
 ```bash
-which at
-which atrm
+which at atrm claude codex
+systemctl status atd            # daemon must be running
 ```
 
-If you don't have at installed, install it using your package management tool and make sure to enable and start it.
-
-Then check if th scheduler daemon is running:
+If `at` is missing, install it via your package manager (`pacman -S at`, `apt install at`, `dnf install at`, …) and enable the daemon:
 
 ```bash
-systemctl status atd
-```
-
-You also need at least one supported agent CLI installed:
-
-```bash
-which claude
-which codex
-```
-
-In practice, the minimum requirement set is:
-
-* Linux
-* `at`
-* `atrm`
-* `atd`
-* `claude` and/or `codex`
-* a text editor such as `nano`, `nvim`, or `code --wait`
-
----
-
-## Use
-
-### Create a job
-
-```bash
-schedule-agent
-```
-
-Typical flow:
-
-* choose agent
-* write prompt
-* choose when to run
-* submit
-
-### Inspect jobs
-
-```bash
-schedule-agent list
-```
-
-### Show job details
-
-```bash
-schedule-agent show <id>
-```
-
-### Reschedule a job
-
-```bash
-schedule-agent reschedule <id> "now + 90 minutes"
-```
-
-or:
-
-```bash
-schedule-agent reschedule <id> "03:00 tomorrow"
-```
-
-### Change session
-
-```bash
-schedule-agent session <id> <session_id>
-```
-
-or reset to a new session:
-
-```bash
-schedule-agent session <id> --new
-```
-
-### Delete a job
-
-```bash
-schedule-agent delete <id>
-```
-
-### Preview before scheduling
-
-```bash
-schedule-agent --dry-run
+sudo systemctl enable --now atd
 ```
 
 ---
 
-## Development
+## How jobs actually run
 
-Install the local quality tooling:
+Understanding this before you schedule something is worth thirty seconds.
 
-```bash
-python3 -m pip install -e ".[dev]"
-```
+### Default agent invocation
 
-Run the same mandatory checks that CI runs:
+schedule-agent invokes agents in **unattended, permissionless mode** — there is no human sitting at the terminal when the job fires, so interactive approval prompts would just hang forever. The defaults are:
 
 ```bash
-make check
+codex exec --dangerously-bypass-approvals-and-sandbox "<your prompt>"
+claude -p --dangerously-skip-permissions            "<your prompt>"
 ```
 
-The enforced gate is:
+These flags are the **default prefix applied to every prompt you schedule**. Your prompt text is passed as the final argument; everything before it is fixed.
 
-* `ruff check .`
-* `ruff format --check .`
-* `pytest -q`
+That means a scheduled job may, without asking:
 
-If you want GitHub to block merges on failures, mark the `quality` workflow as a required status check in branch protection.
+- read, create, modify, or delete files
+- run arbitrary shell commands
+- make network calls
+- change the state of any repository it can reach
 
----
-
-## Remarks
-
-### Agent permissions
-
-Jobs run unattended and without interactive permission prompts.
-
-By default, the tool uses agent commands in the “just do it” style:
-
-```bash
-codex exec --dangerously-bypass-approvals-and-sandbox
-claude -p --dangerously-skip-permissions
-```
-
-That means scheduled agents may:
-
-* modify files
-* run shell commands
-* change repository state
-
-So this is the rule:
-
-```bash
-git status
-```
-
-Check your workspace first, and test prompts manually before scheduling them.
-
----
+**Rule of thumb:** `git status` before you schedule. Test the prompt interactively first. Treat scheduled prompts like cron jobs with a language model attached — because that is what they are.
 
 ### Execution model
 
-Jobs are scheduled through `at`:
+Jobs are handed off to `at`:
 
 ```bash
 at now + 10 minutes
 ```
 
-That has a few consequences:
+Consequences:
 
-* jobs run non-interactively
-* jobs run with a minimal environment
-* jobs do not inherit your full interactive shell setup
+- jobs run non-interactively, with a minimal environment
+- jobs do **not** inherit your full interactive shell (no `direnv`, no shell aliases, no `.zshrc` sugar)
+- stdin is detached so the scheduled shell wrapper never gets swallowed as input
 
-This tool works around that by storing prompts on disk and executing agents with stdin detached, so the scheduled shell wrapper is not accidentally read by the agent.
+Prompts are written to disk first, then read back in when the job fires.
 
 ---
 
-### Mutation model
+## Using it
 
-You can safely modify jobs after creating them:
+Once you've created a job via the TUI, all management is via subcommands.
 
 ```bash
+schedule-agent                               # interactive TUI
+schedule-agent list                          # all jobs
+schedule-agent show <id>                     # full detail
+
+schedule-agent reschedule <id> "now + 90 minutes"
 schedule-agent reschedule <id> "03:00 tomorrow"
+
+schedule-agent session <id> <session_id>     # attach a session
+schedule-agent session <id> --new            # reset to a fresh session
+
+schedule-agent delete <id>
+schedule-agent --dry-run                     # preview without submitting
 ```
 
-If the job was already submitted, the tool will automatically:
+### Safe mutations
 
-```bash
-atrm <job_id>
-at <new time>
-```
+Change your mind after submitting? Fine. If a job is already queued with `at`, schedule-agent automatically:
 
-In other words:
+1. `atrm`s the old submission
+2. rewrites the job definition
+3. resubmits under the new time / session
 
-* old scheduled job is removed
-* job definition is updated
-* job is re-submitted automatically
-
-The same applies when changing session. You do not need to manually track whether a job is queued or already submitted.
+No manual bookkeeping.
 
 ---
 
-### Storage
-
-State is stored in:
-
-```bash
-~/.local/state/schedule-agent
-```
-
-Prompt files are stored in:
-
-```bash
-~/.local/share/schedule-agent/agent_prompts
-```
-
-If `XDG_STATE_HOME` or `XDG_DATA_HOME` are set, those locations are used instead.
-
----
+## Configuration
 
 ### Editor
 
-Prompt editing uses this resolution order:
+Prompt editing resolves in this order:
 
-1. `SCHEDULE_AGENT_EDITOR`
-2. `EDITOR`
-3. fallback: `nano`
-
-For example:
+1. `$SCHEDULE_AGENT_EDITOR`
+2. `$EDITOR`
+3. `nano`
 
 ```bash
 export SCHEDULE_AGENT_EDITOR="nvim"
-```
-
-or:
-
-```bash
+# or
 export EDITOR="code --wait"
 ```
+
+### Storage
+
+| Path | Contents |
+|------|----------|
+| `~/.local/state/schedule-agent/` | job queue + state |
+| `~/.local/share/schedule-agent/agent_prompts/` | prompt files |
+
+`$XDG_STATE_HOME` and `$XDG_DATA_HOME` are honoured if set.
+
+---
+
+## Development
+
+```bash
+python3 -m pip install -e ".[dev]"
+make check
+```
+
+`make check` runs the same gate CI enforces:
+
+- `ruff check .`
+- `ruff format --check .`
+- `pytest -q`
+
+To block merges on failures, mark the `quality` workflow as a required status check in branch protection.
 
 ---
 
