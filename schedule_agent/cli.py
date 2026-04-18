@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import shlex
@@ -9,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -549,6 +550,7 @@ class JobsScreenState:
     cached_jobs: list[dict] = field(default_factory=list)
     atq_error: str | None = None
     show_detail: bool = True  # used in narrow mode
+    show_help: bool = False
     overlay: OverlayState = field(default_factory=OverlayState)
 
     def refresh_jobs(self) -> None:
@@ -735,6 +737,55 @@ def _dispatch_action(
             state.refresh_jobs()
 
 
+# --- Schedule picker helpers ---------------------------------------------
+# The TUI scheduler input is fully constrained so `at` can never receive a
+# malformed spec. Users pick either an HH+MM offset from now or a specific
+# HH:MM; both paths produce a string resolve_schedule_input accepts.
+def _resolve_time_pick(hour: int, minute: int, now: datetime | None = None) -> str:
+    """Return a schedule spec for the next future occurrence of HH:MM."""
+    current = now or datetime.now().astimezone()
+    target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= current:
+        target = target + timedelta(days=1)
+    return target.strftime("%Y-%m-%d %H:%M")
+
+
+def _resolve_offset_pick(hours: int, minutes: int) -> str:
+    """Return a schedule spec for `now + HH:MM` as total minutes."""
+    total = hours * 60 + minutes
+    return f"now + {total} minutes"
+
+
+HELP_TEXT = """\
+Statuses
+  Queued     Created, not yet submitted to at(1)
+  Scheduled  Submitted to at(1), waiting to run
+  Running    Currently executing
+  Waiting    Waiting on a dependency job
+  Blocked    A blocking condition prevents run
+  Completed  Finished with exit code 0
+  Failed     Finished with non-zero exit code
+  Removed    Cancelled / removed from queue
+  Invalid    On-disk metadata is broken
+
+Actions
+  N new         Create a job (agent -> session -> schedule -> prompt)
+  E edit        Edit the selected job's prompt in $EDITOR
+  L log         Tail (running) or page (completed) the job's log file
+  T reschedule  Change when the selected job runs
+  C session     Change the selected job's session id
+  U unschedule  Remove from at(1) but keep metadata
+  S submit      Submit or repair the selected job
+  R retry       Reschedule a completed/failed job
+  D delete      Permanently delete the selected job
+  F filter      Cycle: all / active / completed
+  G refresh     Reload from disk now (auto every 30s)
+  V detail      Toggle detail pane (narrow mode)
+  ? help        Toggle this help view
+  Q quit        Exit the jobs screen
+"""
+
+
 # --- jobs_menu ------------------------------------------------------------
 def jobs_menu() -> int:
     toolkit = _require_prompt_toolkit()
@@ -840,6 +891,44 @@ def jobs_menu() -> int:
         save_jobs(jobs)
         return f"Force-deleted {job['id']}."
 
+    def action_view_log(job: dict) -> str | None:
+        log_file = job.get("last_log_file")
+        if not log_file:
+            raise OperationError("No log file recorded for this job yet.")
+        path = Path(log_file)
+        if not path.exists():
+            raise OperationError(f"Log file missing: {path}")
+        is_running = job.get("display_state") == "running"
+        if is_running:
+            cmd = ["tail", "-f", str(path)]
+        else:
+            pager = os.environ.get("PAGER") or "less"
+            try:
+                cmd = [*shlex.split(pager), str(path)]
+            except ValueError:
+                cmd = [pager, str(path)]
+
+        def _suspend_and_view() -> None:
+            try:
+                subprocess.run(cmd, check=False)
+            except FileNotFoundError as exc:
+                state.message = f"error: {exc}"
+                state.refresh_jobs()
+                return
+            except Exception as exc:  # noqa: BLE001
+                state.message = f"error: {exc}"
+                state.refresh_jobs()
+                return
+            state.message = (
+                f"Stopped tailing log for {job['id']}."
+                if is_running
+                else f"Closed log for {job['id']}."
+            )
+            state.refresh_jobs()
+
+        run_in_terminal(_suspend_and_view)
+        return None
+
     def action_edit_prompt(job: dict) -> str | None:
         path = Path(job["prompt_file"])
         if not path.exists():
@@ -870,6 +959,7 @@ def jobs_menu() -> int:
         spec = form["schedule_spec"]
         prompt = form["prompt"]
         cwd = form.get("cwd") or str(Path.cwd())
+        submit = form.get("submit", True)
         job = create_job(
             agent=agent,
             session_mode=session_mode,
@@ -877,10 +967,70 @@ def jobs_menu() -> int:
             prompt_text=prompt,
             schedule_spec=spec,
             cwd=cwd,
-            submit=True,
+            submit=submit,
         )
-        run_at = iso_to_display(job["scheduled_for"], with_seconds=True)
-        return f"Scheduled {job['id']} for {run_at}."
+        if submit:
+            run_at = iso_to_display(job["scheduled_for"], with_seconds=True)
+            return f"Scheduled {job['id']} for {run_at}."
+        return f"Created {job['id']} (not submitted)."
+
+    # ---------- schedule picker (generic) ----------
+    # A three-stage constrained flow; result is a schedule spec string that
+    # resolve_schedule_input accepts. `on_spec(spec)` is called once the user
+    # has finished picking. Callers: new-job, reschedule, retry.
+    def schedule_picker_start(prompt_prefix: str, on_spec: Callable[[str], str | None]) -> None:
+        items = [("Offset from now", "offset"), ("Specific time", "time")]
+        open_picker(
+            f"{prompt_prefix}: pick mode",
+            items,
+            on_pick=lambda mode: _schedule_picker_mode(prompt_prefix, mode, on_spec),
+        )
+
+    def _schedule_picker_mode(
+        prompt_prefix: str,
+        mode: str,
+        on_spec: Callable[[str], str | None],
+    ) -> str | None:
+        hour_items = [(f"{h:02d}", h) for h in range(24)]
+        if mode == "offset":
+            open_picker(
+                f"{prompt_prefix}: offset hours",
+                hour_items,
+                on_pick=lambda hour: _schedule_pick_offset_minute(prompt_prefix, hour, on_spec),
+            )
+            return None
+        open_picker(
+            f"{prompt_prefix}: hour",
+            hour_items,
+            on_pick=lambda hour: _schedule_pick_time_minute(prompt_prefix, hour, on_spec),
+        )
+        return None
+
+    def _schedule_pick_time_minute(
+        prompt_prefix: str,
+        hour: int,
+        on_spec: Callable[[str], str | None],
+    ) -> str | None:
+        items = [(f"{m:02d}", m) for m in range(0, 60, 5)]
+        open_picker(
+            f"{prompt_prefix}: minute",
+            items,
+            on_pick=lambda minute: on_spec(_resolve_time_pick(hour, minute)),
+        )
+        return None
+
+    def _schedule_pick_offset_minute(
+        prompt_prefix: str,
+        hour: int,
+        on_spec: Callable[[str], str | None],
+    ) -> str | None:
+        items = [(f"{m:02d}", m) for m in range(0, 60, 5)]
+        open_picker(
+            f"{prompt_prefix}: offset minutes",
+            items,
+            on_pick=lambda minute: on_spec(_resolve_offset_pick(hour, minute)),
+        )
+        return None
 
     # ---------- staged new-job flow ----------
     # The flow is a sequence of picker/input/editor steps. The in-progress
@@ -926,25 +1076,25 @@ def jobs_menu() -> int:
 
     def _nj_picked_session(form: dict, session_id: str | None) -> str | None:
         form["session_id"] = session_id
-        _nj_input_schedule(form)
+        _nj_pick_schedule(form)
         return None
 
-    def _nj_input_schedule(form: dict) -> None:
-        open_input(
-            "New job: schedule spec (Enter to confirm, Esc to cancel)",
-            default=form["schedule_spec"],
-            on_submit=lambda value: _nj_submitted_schedule(form, value),
+    def _nj_pick_schedule(form: dict) -> None:
+        schedule_picker_start(
+            "New job: schedule",
+            on_spec=lambda spec: _nj_picked_schedule(form, spec),
         )
 
-    def _nj_submitted_schedule(form: dict, value: str) -> str | None:
-        form["schedule_spec"] = value.strip() or form["schedule_spec"]
+    def _nj_picked_schedule(form: dict, spec: str) -> str | None:
+        form["schedule_spec"] = spec
         _nj_capture_prompt(form)
         return None
 
     def _nj_capture_prompt(form: dict) -> None:
         # `run_in_terminal` is async — the callback must contain everything
-        # that happens after the editor exits, otherwise the job would be
-        # created before the user wrote the prompt.
+        # that happens after the editor exits. When the editor closes, we
+        # arm the submit-confirm overlay so it appears as soon as the TUI
+        # redraws.
         def _suspend_and_capture() -> None:
             try:
                 text = read_prompt()
@@ -957,15 +1107,18 @@ def jobs_menu() -> int:
                 state.refresh_jobs()
                 return
             form["prompt"] = text or ""
-            try:
-                state.message = action_create_job(form)
-            except OperationError as exc:
-                state.message = f"error: {exc}"
-            except Exception as exc:  # noqa: BLE001
-                state.message = f"error: {exc}"
-            state.refresh_jobs()
+            state.overlay = OverlayState(
+                kind="confirm",
+                prompt="Submit to at queue now?",
+                default=True,
+                on_confirm=lambda submit: _nj_confirmed_submit(form, submit),
+            )
 
         run_in_terminal(_suspend_and_capture)
+
+    def _nj_confirmed_submit(form: dict, submit: bool) -> str | None:
+        form["submit"] = submit
+        return action_create_job(form)
 
     # ---------- rendering ----------
     def header_fragments():
@@ -991,30 +1144,68 @@ def jobs_menu() -> int:
 
         for index, job in enumerate(state.cached_jobs):
             selected = index == state.selected
-            style = ""
+            # Selected row uses the reverse-video selected style uniformly so
+            # the highlight stays legible; everything else is either normal
+            # or muted (completed), with the status column getting its own
+            # per-state colour for quick visual scanning.
+            row_style = ""
             if selected:
-                style = "class:selected"
+                row_style = "class:selected"
             elif job.get("display_state") == "completed":
-                style = "class:muted"
-            fragments.append((style, render_summary_row(job, columns, selected) + "\n"))
+                row_style = "class:muted"
+            fragments.append((row_style, "> " if selected else "  "))
+            for column, col_width in columns:
+                padded = _pad(_column_value(job, column), col_width)
+                if column == "status" and not selected:
+                    status_style = f"class:status-{job.get('display_state', 'invalid')}"
+                    fragments.append((status_style, padded))
+                else:
+                    fragments.append((row_style, padded))
+                fragments.append((row_style, " "))
+            fragments.append((row_style, "\n"))
         return fragments
 
     def detail_fragments():
+        if state.show_help:
+            return [("", HELP_TEXT)]
         job = state.current_job()
         return [("", render_detail(job) + "\n")]
 
-    def _help_hints() -> str:
-        return (
-            " n new  e edit  t reschedule  c session  u unschedule"
-            "  s submit  r retry  d delete  f filter  g refresh"
-            "  v detail  q quit "
-        )
+    def _maybe_dismiss_help() -> None:
+        if state.show_help:
+            state.show_help = False
+
+    _HELP_HINT_PAIRS: list[tuple[str, str]] = [
+        ("N", "ew"),
+        ("E", "dit prompt"),
+        ("L", "og"),
+        ("T", " time"),
+        ("C", " session"),
+        ("U", "nschedule"),
+        ("S", "ubmit"),
+        ("R", "etry"),
+        ("D", "elete"),
+        ("F", "ilter"),
+        ("G", " refresh"),
+        ("V", " detail"),
+        ("?", " help"),
+        ("Q", "uit"),
+    ]
+
+    def _help_hint_fragments() -> list[tuple[str, str]]:
+        fragments: list[tuple[str, str]] = [("class:footer", " ")]
+        for key, rest in _HELP_HINT_PAIRS:
+            fragments.append(("class:key", key))
+            fragments.append(("class:footer", f"{rest}  "))
+        fragments.append(("class:footer", "\n"))
+        return fragments
 
     def footer_fragments():
-        fragments: list[tuple[str, str]] = [("class:footer", _help_hints() + "\n")]
+        fragments: list[tuple[str, str]] = _help_hint_fragments()
         overlay = state.overlay
         if overlay.kind == "confirm":
-            fragments.append(("class:overlay", f" {overlay.prompt} [y/N] "))
+            hint = "[Y/n]" if overlay.default else "[y/N]"
+            fragments.append(("class:overlay", f" {overlay.prompt} {hint} "))
             return fragments
         if overlay.kind == "input":
             fragments.append(("class:overlay", f" {overlay.prompt}: {overlay.buffer}_ "))
@@ -1126,6 +1317,13 @@ def jobs_menu() -> int:
     def _confirm_esc(event):
         overlay_confirm_key("escape")
 
+    @kb.add("enter", filter=confirm_overlay)
+    def _confirm_enter(event):
+        overlay = state.overlay
+        if overlay.kind != "confirm" or overlay.on_confirm is None:
+            return
+        overlay_confirm_key("y" if overlay.default else "n")
+
     # ----- overlay: input -----
     @kb.add("enter", filter=input_overlay)
     def _input_enter(event):
@@ -1178,25 +1376,36 @@ def jobs_menu() -> int:
         state.message = "Cancelled."
 
     # ----- normal keybindings (no overlay) -----
+    # Convention: every no_overlay handler starts by calling
+    # _maybe_dismiss_help() so pressing any top-level key closes the help
+    # view and still runs the action. `?` itself toggles, bypassing that.
+    @kb.add("?", filter=no_overlay)
+    def _toggle_help(event):
+        state.show_help = not state.show_help
+
     @kb.add("q", filter=no_overlay)
     def _quit(event):
+        _maybe_dismiss_help()
         state.quit = True
         event.app.exit()
 
     @kb.add("j", filter=no_overlay)
     @kb.add("down", filter=no_overlay)
     def _down(event):
+        _maybe_dismiss_help()
         if state.cached_jobs:
             state.selected = (state.selected + 1) % len(state.cached_jobs)
 
     @kb.add("k", filter=no_overlay)
     @kb.add("up", filter=no_overlay)
     def _up(event):
+        _maybe_dismiss_help()
         if state.cached_jobs:
             state.selected = (state.selected - 1) % len(state.cached_jobs)
 
     @kb.add("f", filter=no_overlay)
     def _cycle_filter(event):
+        _maybe_dismiss_help()
         filters = ["all", "active", "completed"]
         state.filter = filters[(filters.index(state.filter) + 1) % len(filters)]
         state.selected = 0
@@ -1205,16 +1414,19 @@ def jobs_menu() -> int:
 
     @kb.add("g", filter=no_overlay)
     def _refresh(event):
+        _maybe_dismiss_help()
         state.refresh_jobs()
         state.message = "Refreshed."
 
     @kb.add("v", filter=no_overlay)
     def _toggle_detail(event):
+        _maybe_dismiss_help()
         state.show_detail = not state.show_detail
         state.message = "Detail shown." if state.show_detail else "Detail hidden."
 
     @kb.add("enter", filter=no_overlay)
     def _enter_toggle_detail(event):
+        _maybe_dismiss_help()
         # In narrow mode, Enter toggles detail; in wider modes it is a
         # no-op (detail already visible beside the list).
         if _layout_mode_now() == "narrow":
@@ -1222,30 +1434,42 @@ def jobs_menu() -> int:
 
     @kb.add("n", filter=no_overlay)
     def _new(event):
+        _maybe_dismiss_help()
         start_new_job_flow()
 
     @kb.add("e", filter=no_overlay)
     def _edit(event):
+        _maybe_dismiss_help()
         job = state.current_job()
         if not job:
             state.message = "No job selected."
             return
         _dispatch_action(state, lambda: action_edit_prompt(job))
 
-    @kb.add("t", filter=no_overlay)
-    def _reschedule(event):
+    @kb.add("l", filter=no_overlay)
+    def _log(event):
+        _maybe_dismiss_help()
         job = state.current_job()
         if not job:
             state.message = "No job selected."
             return
-        open_input(
-            f"Reschedule {job['id']} (Enter/Esc)",
-            default="now + 5 minutes",
-            on_submit=lambda spec: action_reschedule(job, spec.strip() or "now + 5 minutes"),
+        _dispatch_action(state, lambda: action_view_log(job))
+
+    @kb.add("t", filter=no_overlay)
+    def _reschedule(event):
+        _maybe_dismiss_help()
+        job = state.current_job()
+        if not job:
+            state.message = "No job selected."
+            return
+        schedule_picker_start(
+            f"Reschedule {job['id']}",
+            on_spec=lambda spec: action_reschedule(job, spec),
         )
 
     @kb.add("c", filter=no_overlay)
     def _session(event):
+        _maybe_dismiss_help()
         job = state.current_job()
         if not job:
             state.message = "No job selected."
@@ -1264,6 +1488,7 @@ def jobs_menu() -> int:
 
     @kb.add("u", filter=no_overlay)
     def _unschedule(event):
+        _maybe_dismiss_help()
         job = state.current_job()
         if not job:
             state.message = "No job selected."
@@ -1272,6 +1497,7 @@ def jobs_menu() -> int:
 
     @kb.add("s", filter=no_overlay)
     def _submit(event):
+        _maybe_dismiss_help()
         job = state.current_job()
         if not job:
             state.message = "No job selected."
@@ -1280,18 +1506,19 @@ def jobs_menu() -> int:
 
     @kb.add("r", filter=no_overlay)
     def _retry(event):
+        _maybe_dismiss_help()
         job = state.current_job()
         if not job:
             state.message = "No job selected."
             return
-        open_input(
-            f"Retry {job['id']} (Enter/Esc)",
-            default="now + 5 minutes",
-            on_submit=lambda spec: action_retry(job, spec.strip() or "now + 5 minutes"),
+        schedule_picker_start(
+            f"Retry {job['id']}",
+            on_spec=lambda spec: action_retry(job, spec),
         )
 
     @kb.add("d", filter=no_overlay)
     def _delete(event):
+        _maybe_dismiss_help()
         job = state.current_job()
         if not job:
             state.message = "No job selected."
@@ -1320,8 +1547,12 @@ def jobs_menu() -> int:
     # Main body: list on the left, detail on the right — but the detail pane
     # is only shown when width is large enough and the user hasn't toggled
     # it off (narrow mode).
-    show_detail_pane = Condition(lambda: _layout_mode_now() != "narrow" and state.show_detail)
-    show_detail_overlay = Condition(lambda: _layout_mode_now() == "narrow" and state.show_detail)
+    show_detail_pane = Condition(
+        lambda: _layout_mode_now() != "narrow" and (state.show_detail or state.show_help)
+    )
+    show_detail_overlay = Condition(
+        lambda: _layout_mode_now() == "narrow" and (state.show_detail or state.show_help)
+    )
     show_picker_overlay = Condition(lambda: state.overlay.kind == "picker")
 
     summary_window = Window(
@@ -1376,9 +1607,19 @@ def jobs_menu() -> int:
             "selected": "reverse",
             "muted": "fg:#888888",
             "footer": "reverse",
+            "key": "reverse bold underline",
             "message": "fg:#ffaf00",
             "overlay": "fg:#ffffff bg:#005f87 bold",
             "overlay-title": "bold",
+            "status-queued": "fg:#ffd75f",
+            "status-scheduled": "fg:#5fd7ff",
+            "status-running": "fg:#5fff5f bold",
+            "status-waiting": "fg:#ffaf00",
+            "status-blocked": "fg:#ff5f5f",
+            "status-completed": "fg:#87d787",
+            "status-failed": "fg:#ff5f5f bold",
+            "status-removed": "fg:#888888",
+            "status-invalid": "fg:#ff5fff",
         }
     )
 
@@ -1389,7 +1630,25 @@ def jobs_menu() -> int:
         style=style,
         mouse_support=False,
     )
-    app.run()
+
+    async def _auto_refresh() -> None:
+        # Silent 30s tick. Skips while an overlay is open so the user's
+        # in-progress picker/confirm/input doesn't visibly reset.
+        try:
+            while True:
+                await asyncio.sleep(30)
+                if state.quit:
+                    return
+                if state.overlay.kind is None:
+                    state.refresh_jobs()
+                    app.invalidate()
+        except asyncio.CancelledError:
+            return
+
+    def _start_background_tasks() -> None:
+        app.create_background_task(_auto_refresh())
+
+    app.run(pre_run=_start_background_tasks)
     return 0
 
 
