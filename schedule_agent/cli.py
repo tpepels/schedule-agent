@@ -2025,7 +2025,81 @@ def build_arg_parser() -> argparse.ArgumentParser:
     failed_p.add_argument("--exit-code", required=True, type=int)
     failed_p.add_argument("--log-file")
 
+    doctor_p = sub.add_parser(
+        "doctor",
+        help="Run environment preflight checks and print a report.",
+    )
+    doctor_p.add_argument(
+        "--roundtrip",
+        action="store_true",
+        help="Also submit and cancel a real `at` job to verify atd.",
+    )
+    doctor_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the report as JSON instead of the human table.",
+    )
+    verbosity = doctor_p.add_mutually_exclusive_group()
+    verbosity.add_argument(
+        "--verbose", action="store_true", help="Include PASS/SKIP details."
+    )
+    verbosity.add_argument(
+        "--quiet", action="store_true", help="Only show WARN/FAIL rows."
+    )
+
     return parser
+
+
+def _doctor_filter(results: list, quiet: bool) -> list:
+    if quiet:
+        return [r for r in results if r.severity in ("FAIL", "WARN")]
+    return list(results)
+
+
+def cli_doctor(
+    roundtrip: bool = False,
+    as_json: bool = False,
+    verbose: bool = False,
+    quiet: bool = False,
+) -> int:
+    from . import preflight
+
+    report = preflight.run_checks(include_roundtrip=roundtrip)
+
+    if as_json:
+        payload = {
+            "critical_ok": report.critical_ok(),
+            "results": [
+                {
+                    "name": r.name,
+                    "label": r.label,
+                    "severity": r.severity,
+                    "message": r.message,
+                    "detail": r.detail,
+                }
+                for r in report.results
+            ],
+        }
+        print(json.dumps(payload, indent=2, default=str))
+        return 0 if report.critical_ok() else 1
+
+    rows = _doctor_filter(report.results, quiet=quiet)
+    label_width = max((len(r.label) for r in rows), default=0)
+    sev_width = max((len(r.severity) for r in rows), default=4)
+    for r in rows:
+        print(f"{r.severity:<{sev_width}}  {r.label:<{label_width}}  {r.message}")
+        if verbose and r.detail:
+            for key, value in r.detail.items():
+                print(f"{'':<{sev_width}}  {'':<{label_width}}    {key}: {value}")
+
+    if report.critical_failures():
+        print()
+        print(f"{len(report.critical_failures())} critical failure(s).")
+        return 1
+    if report.warnings() and not quiet:
+        print()
+        print(f"{len(report.warnings())} warning(s).")
+    return 0
 
 
 def _print_deprecated_cli_surface(command: str, replacement: str) -> None:
@@ -2068,6 +2142,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cli_retry_job(args.job_id, args.when)
         if args.command == "submit":
             return cli_submit_job(args.job_id)
+        if args.command == "doctor":
+            return cli_doctor(
+                roundtrip=args.roundtrip,
+                as_json=args.json,
+                verbose=args.verbose,
+                quiet=args.quiet,
+            )
         if args.command == "mark":
             if args.mark_state == "running":
                 return cli_mark_running(
