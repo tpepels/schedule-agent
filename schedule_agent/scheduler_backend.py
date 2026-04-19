@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import shutil
@@ -14,6 +15,21 @@ from .time_utils import (
 )
 
 ATQ_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S%z"
+DEFAULT_PATH_ENTRIES = ["/usr/local/bin", "/usr/bin", "/bin"]
+
+
+def _run_at(cmd, **kwargs):
+    """Invoke an `at`/`atq`/`atrm` subprocess under a C locale.
+
+    Parsing `at` stderr/stdout relies on English phrasings like "job N at";
+    forcing LC_ALL=C/LANG=C makes the output deterministic regardless of
+    the user's shell locale.
+    """
+    env = kwargs.pop("env", None)
+    env = dict(os.environ) if env is None else dict(env)
+    env["LC_ALL"] = "C"
+    env["LANG"] = "C"
+    return subprocess.run(cmd, env=env, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -47,10 +63,13 @@ def parse_atq_line(line: str) -> AtqEntry | None:
 def build_script(job: dict) -> str:
     cmd = build_agent_cmd(job)
     sa_bin = shlex.quote(shutil.which("schedule-agent") or "schedule-agent")
+    provenance = job.get("provenance") or {}
+    path_entries = provenance.get("path_snapshot_cleaned") or DEFAULT_PATH_ENTRIES
+    path_export = ":".join(path_entries)
     return "\n".join(
         [
             f"cd {shlex.quote(job['cwd'])} || exit 1",
-            "export PATH=/usr/local/bin:/usr/bin:/bin",
+            f"export PATH={path_export}",
             f"mkdir -p {shlex.quote(job['log_dir'])} || exit 1",
             'started_at="$(date --iso-8601=seconds)"',
             f'log_file={shlex.quote(job["log_dir"])}/"$started_at".log',
@@ -84,7 +103,7 @@ def submit_job(job: dict, dry_run: bool = False) -> tuple[str | None, str]:
         preview = f"Would schedule at {job['scheduled_for']} via `at -t {at_time}`\n\n{script}"
         return None, preview
 
-    proc = subprocess.run(
+    proc = _run_at(
         ["at", "-t", at_time],
         input=script,
         text=True,
@@ -101,7 +120,7 @@ def submit_job(job: dict, dry_run: bool = False) -> tuple[str | None, str]:
 
 
 def remove_at_job(at_job_id: str) -> tuple[bool, str]:
-    proc = subprocess.run(
+    proc = _run_at(
         ["atrm", str(at_job_id)],
         capture_output=True,
         text=True,
@@ -114,7 +133,7 @@ def query_atq(job_ids: list[str] | None = None) -> tuple[dict[str, AtqEntry], st
     if job_ids:
         cmd.extend(job_ids)
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = _run_at(cmd, capture_output=True, text=True)
     except FileNotFoundError:
         return {}, "atq unavailable"
     if proc.returncode != 0:

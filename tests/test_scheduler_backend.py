@@ -24,7 +24,7 @@ def _job():
 def test_resolve_schedule_spec_normalizes_shorthand(app_modules, monkeypatch):
     backend = app_modules.scheduler_backend
 
-    def fake_run(cmd, capture_output=None, text=None):
+    def fake_run(cmd, capture_output=None, text=None, **kwargs):
         assert cmd[:3] == ["date", "-d", "now + 10 minutes"]
         return _Proc(stdout="2026-04-18T09:10:00+0100\n")
 
@@ -45,7 +45,7 @@ def test_submit_job_uses_at_dash_t(app_modules, monkeypatch):
     backend = app_modules.scheduler_backend
     captured = {}
 
-    def fake_run(cmd, input=None, text=None, capture_output=None):
+    def fake_run(cmd, input=None, text=None, capture_output=None, **kwargs):
         captured["cmd"] = cmd
         captured["input"] = input
         return _Proc(stderr="job 42 at Fri Apr 18 09:00:00 2026\n")
@@ -119,3 +119,50 @@ def test_submit_job_dry_run_shows_wrapper_preview(app_modules):
     assert at_job_id is None
     assert "Would schedule at 2026-04-18T09:00:00+0000 via `at -t 202604180900.00`" in output
     assert "schedule-agent mark running job1" in output
+
+
+def test_build_script_legacy_job_uses_default_path(app_modules):
+    script = app_modules.scheduler_backend.build_script(_job())
+    assert "export PATH=/usr/local/bin:/usr/bin:/bin" in script
+
+
+def test_build_script_uses_provenance_path_and_bin(app_modules):
+    job = _job()
+    job["provenance"] = {
+        "agent_path": "/opt/claude/bin/claude",
+        "path_snapshot_cleaned": ["/home/u/.local/bin", "/usr/bin", "/bin"],
+    }
+    script = app_modules.scheduler_backend.build_script(job)
+    assert "export PATH=/home/u/.local/bin:/usr/bin:/bin" in script
+    assert "/opt/claude/bin/claude" in script
+
+
+def test_run_at_injects_c_locale(app_modules, monkeypatch):
+    backend = app_modules.scheduler_backend
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env")
+        return _Proc(stderr="job 7 at Mon Jan 1 00:00:00 2030\n")
+
+    monkeypatch.setattr(backend.subprocess, "run", fake_run)
+    backend.submit_job(_job())
+    assert captured["env"]["LC_ALL"] == "C"
+    assert captured["env"]["LANG"] == "C"
+
+
+def test_run_at_preserves_existing_env(app_modules, monkeypatch):
+    backend = app_modules.scheduler_backend
+    monkeypatch.setenv("SCHEDULE_AGENT_CUSTOM", "keep-me")
+
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return _Proc(stderr="job 7 at Mon Jan 1 00:00:00 2030\n")
+
+    monkeypatch.setattr(backend.subprocess, "run", fake_run)
+    backend.submit_job(_job())
+    assert captured["env"]["SCHEDULE_AGENT_CUSTOM"] == "keep-me"
+    assert captured["env"]["LC_ALL"] == "C"
