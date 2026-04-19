@@ -10,10 +10,11 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from .config import ensure_prompt_prefix
 from .execution import AGENTS, build_agent_cmd
 from .legacy import cli_state as legacy_cli_state
 from .legacy.compat import legacy_state_file
@@ -43,7 +44,7 @@ from .persistence import (
     write_prompt_file as _write_prompt_file,
 )
 from .scheduler_backend import submit_job
-from .time_utils import iso_to_display
+from .time_utils import iso_to_display, parse_iso_datetime
 from .transitions import on_cancel
 
 APP_NAME = "schedule-agent"
@@ -214,12 +215,22 @@ def extract_session_title(path: str, agent: str) -> str | None:
     return None
 
 
+def _safe_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def _discover_codex_sessions(limit: int) -> list[SessionInfo]:
     root = Path.home() / ".codex" / "sessions"
     if not root.exists():
         return []
-    files = [path for path in root.rglob("*.jsonl") if path.is_file()]
-    files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    try:
+        files = [path for path in root.rglob("*.jsonl") if path.is_file()]
+    except OSError:
+        return []
+    files.sort(key=_safe_mtime, reverse=True)
     return [
         SessionInfo(
             id=path.stem,
@@ -227,7 +238,7 @@ def _discover_codex_sessions(limit: int) -> list[SessionInfo]:
             agent="codex",
             project=None,
             title=extract_session_title(str(path), "codex"),
-            modified_at=path.stat().st_mtime,
+            modified_at=_safe_mtime(path),
         )
         for path in files[:limit]
     ]
@@ -239,7 +250,14 @@ def _discover_claude_sessions(cwd: Path | None, limit: int) -> list[SessionInfo]
         return []
 
     def top_level_jsonl(project_dir: Path) -> list[tuple[Path, str]]:
-        return [(path, project_dir.name) for path in project_dir.glob("*.jsonl") if path.is_file()]
+        try:
+            return [
+                (path, project_dir.name)
+                for path in project_dir.glob("*.jsonl")
+                if path.is_file()
+            ]
+        except OSError:
+            return []
 
     preferred_name = cwd.as_posix().replace("/", "-") if cwd is not None else None
     preferred: list[tuple[Path, str]] = []
@@ -249,16 +267,20 @@ def _discover_claude_sessions(cwd: Path | None, limit: int) -> list[SessionInfo]
         preferred_dir = root / preferred_name
         if preferred_dir.exists():
             preferred = top_level_jsonl(preferred_dir)
-            preferred.sort(key=lambda pair: pair[0].stat().st_mtime, reverse=True)
+            preferred.sort(key=lambda pair: _safe_mtime(pair[0]), reverse=True)
 
-    for project_dir in root.iterdir():
+    try:
+        project_dirs = list(root.iterdir())
+    except OSError:
+        project_dirs = []
+    for project_dir in project_dirs:
         if not project_dir.is_dir():
             continue
         if preferred_name and project_dir.name == preferred_name:
             continue
         other.extend(top_level_jsonl(project_dir))
 
-    other.sort(key=lambda pair: pair[0].stat().st_mtime, reverse=True)
+    other.sort(key=lambda pair: _safe_mtime(pair[0]), reverse=True)
     combined = (preferred + other)[:limit]
     return [
         SessionInfo(
@@ -267,7 +289,7 @@ def _discover_claude_sessions(cwd: Path | None, limit: int) -> list[SessionInfo]
             agent="claude",
             project=project_name,
             title=extract_session_title(str(path), "claude"),
-            modified_at=path.stat().st_mtime,
+            modified_at=_safe_mtime(path),
         )
         for path, project_name in combined
     ]
@@ -279,27 +301,50 @@ def discover_sessions(agent: str, cwd: Path | None = None, limit: int = 10) -> l
     return _discover_claude_sessions(cwd, limit)
 
 
+PASTE_SESSION_LABEL = "Paste session ID..."
+
+
+def _prompt_paste_session_id() -> str | None:
+    try:
+        from prompt_toolkit.shortcuts import input_dialog
+    except ModuleNotFoundError as exc:
+        raise OperationError(
+            "prompt_toolkit is required for the interactive UI. "
+            "Install project dependencies first."
+        ) from exc
+    result = input_dialog(
+        title=APP_NAME,
+        text="Paste session ID (leave empty to cancel):",
+    ).run()
+    if result is None:
+        raise KeyboardInterrupt
+    result = result.strip()
+    return result or None
+
+
 def choose_session(agent: str, cwd: Path | None = None) -> str | None:
     sessions = discover_sessions(agent, cwd=cwd)
-    if not sessions:
-        return None
-
     labels = ["New session"] + [
         f"{(session.title or '[no title]')} [{session.id[:8]}]" for session in sessions
-    ]
+    ] + [PASTE_SESSION_LABEL]
+
     selected = choose("Session", labels, default="New session")
     if selected == "New session":
         return None
-    for session, label in zip(sessions, labels[1:]):
+    if selected == PASTE_SESSION_LABEL:
+        return _prompt_paste_session_id()
+    for session, label in zip(sessions, labels[1:-1]):
         if label == selected:
             return session.id
     return None
 
 
-def read_prompt() -> str:
+def read_prompt(initial: str = "") -> str:
     with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as handle:
         path = Path(handle.name)
     try:
+        if initial:
+            path.write_text(initial, encoding="utf-8")
         edit_file(path)
         text = path.read_text(encoding="utf-8").strip()
     finally:
@@ -551,10 +596,14 @@ class JobsScreenState:
     atq_error: str | None = None
     show_detail: bool = True  # used in narrow mode
     show_help: bool = False
+    search_query: str = ""
     overlay: OverlayState = field(default_factory=OverlayState)
 
     def refresh_jobs(self) -> None:
         jobs, atq_error = list_job_views(self.filter)
+        if self.search_query:
+            needle = self.search_query.lower()
+            jobs = [j for j in jobs if needle in (j.get("title") or "").lower()]
         self.cached_jobs = jobs
         self.atq_error = atq_error
         if not jobs:
@@ -582,11 +631,69 @@ class JobsScreenState:
 
 TITLE_MIN = 18
 TITLE_IDEAL = 28
-TITLE_MAX = 40
+TITLE_MAX = 80
 STATUS_W = 10
-RUN_AT_W = 16
+RUN_AT_W = 28
 SESSION_W = 12
 UPDATED_W = 16
+CREATED_W = 16
+
+
+def _format_delta_short(seconds: float) -> str:
+    """Compact human delta: '5s', '42m', '3h 12m', '2d 4h'."""
+    total = int(abs(seconds))
+    if total < 60:
+        return f"{total}s"
+    minutes, _ = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, rem_min = divmod(minutes, 60)
+    if hours < 24:
+        if rem_min:
+            return f"{hours}h {rem_min}m"
+        return f"{hours}h"
+    days, rem_hrs = divmod(hours, 24)
+    if rem_hrs:
+        return f"{days}d {rem_hrs}h"
+    return f"{days}d"
+
+
+def _relative_time(iso: str | None, now: datetime | None = None) -> str:
+    """Return '(in 5m)' / '(4h ago)' / '(now)' for an ISO timestamp."""
+    if not iso:
+        return ""
+    try:
+        target = parse_iso_datetime(iso).astimezone()
+    except Exception:
+        return ""
+    current = (now or datetime.now()).astimezone()
+    delta = (target - current).total_seconds()
+    if -30 <= delta <= 30:
+        return "(now)"
+    if delta > 0:
+        return f"(in {_format_delta_short(delta)})"
+    return f"({_format_delta_short(delta)} ago)"
+
+
+def _elapsed_since(iso: str | None, now: datetime | None = None) -> str | None:
+    """Return 'running for Xm Ys' given an ISO start timestamp, or None."""
+    if not iso:
+        return None
+    try:
+        started = parse_iso_datetime(iso).astimezone()
+    except Exception:
+        return None
+    current = (now or datetime.now()).astimezone()
+    delta = int((current - started).total_seconds())
+    if delta < 0:
+        delta = 0
+    if delta < 60:
+        return f"running for {delta}s"
+    minutes, seconds = divmod(delta, 60)
+    if minutes < 60:
+        return f"running for {minutes}m {seconds}s"
+    hours, rem_min = divmod(minutes, 60)
+    return f"running for {hours}h {rem_min}m"
 
 
 def _truncate(value: str, width: int) -> str:
@@ -609,11 +716,20 @@ def _layout_mode(total_width: int) -> str:
         return "narrow"
     if total_width < 120:
         return "medium"
-    return "wide"
+    if total_width < 160:
+        return "wide"
+    return "xwide"
 
 
 def _summary_columns(mode: str, total_width: int) -> list[tuple[str, int]]:
-    """Return ordered (column_name, width) tuples for the given layout mode."""
+    """Return ordered (column_name, width) tuples for the given layout mode.
+
+    On wide/xwide terminals, the detail pane consumes roughly half the
+    width (capped at DETAIL_MAX_W elsewhere), so the list budget is based
+    on `total_width` rather than the full terminal width — callers are
+    expected to pass the already-apportioned width when a detail pane is
+    visible.
+    """
     # Reserve 1 column for left gutter (selection marker), and gaps (1 each).
     # Build right-hand fixed columns first, then give the rest to title.
     if mode == "narrow":
@@ -630,8 +746,18 @@ def _summary_columns(mode: str, total_width: int) -> list[tuple[str, int]]:
             ("run_at", RUN_AT_W),
             ("session", SESSION_W),
         ]
-    # wide
-    fixed = STATUS_W + RUN_AT_W + SESSION_W + UPDATED_W + 4
+    if mode == "wide":
+        fixed = STATUS_W + RUN_AT_W + SESSION_W + UPDATED_W + 4
+        title_width = max(TITLE_MIN, min(TITLE_MAX, total_width - fixed - 1))
+        return [
+            ("title", title_width),
+            ("status", STATUS_W),
+            ("run_at", RUN_AT_W),
+            ("session", SESSION_W),
+            ("updated", UPDATED_W),
+        ]
+    # xwide
+    fixed = STATUS_W + RUN_AT_W + SESSION_W + UPDATED_W + CREATED_W + 5
     title_width = max(TITLE_MIN, min(TITLE_MAX, total_width - fixed - 1))
     return [
         ("title", title_width),
@@ -639,6 +765,7 @@ def _summary_columns(mode: str, total_width: int) -> list[tuple[str, int]]:
         ("run_at", RUN_AT_W),
         ("session", SESSION_W),
         ("updated", UPDATED_W),
+        ("created", CREATED_W),
     ]
 
 
@@ -648,7 +775,9 @@ def _column_value(job: dict, column: str) -> str:
     if column == "status":
         return job.get("display_label") or "Invalid"
     if column == "run_at":
-        return iso_to_display(job.get("scheduled_for")) or "-"
+        base = iso_to_display(job.get("scheduled_for")) or "-"
+        rel = _relative_time(job.get("scheduled_for"))
+        return f"{base} {rel}".rstrip() if rel else base
     if column == "session":
         sid = job.get("session_id")
         if sid:
@@ -656,6 +785,8 @@ def _column_value(job: dict, column: str) -> str:
         return job.get("session_mode") or "-"
     if column == "updated":
         return iso_to_display(job.get("updated_at")) or "-"
+    if column == "created":
+        return iso_to_display(job.get("created_at")) or "-"
     return ""
 
 
@@ -666,6 +797,7 @@ def _column_header(column: str) -> str:
         "run_at": "Run At",
         "session": "Session",
         "updated": "Updated",
+        "created": "Created",
     }.get(column, column.title())
 
 
@@ -738,21 +870,15 @@ def _dispatch_action(
 
 
 # --- Schedule picker helpers ---------------------------------------------
-# The TUI scheduler input is fully constrained so `at` can never receive a
-# malformed spec. Users pick either an HH+MM offset from now or a specific
-# HH:MM; both paths produce a string resolve_schedule_input accepts.
-def _resolve_time_pick(hour: int, minute: int, now: datetime | None = None) -> str:
-    """Return a schedule spec for the next future occurrence of HH:MM."""
-    current = now or datetime.now().astimezone()
-    target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if target <= current:
-        target = target + timedelta(days=1)
-    return target.strftime("%Y-%m-%d %H:%M")
-
-
+# The TUI scheduler is fully constrained: the user picks HH then MM (same
+# shape as a clock input) and we treat the result as an offset from now,
+# producing a string resolve_schedule_input accepts. Using an offset avoids
+# ambiguity around "specific time" drifting into the past by a few minutes.
 def _resolve_offset_pick(hours: int, minutes: int) -> str:
     """Return a schedule spec for `now + HH:MM` as total minutes."""
     total = hours * 60 + minutes
+    if total <= 0:
+        total = 1
     return f"now + {total} minutes"
 
 
@@ -769,20 +895,25 @@ Statuses
   Invalid    On-disk metadata is broken
 
 Actions
-  N new         Create a job (agent -> session -> schedule -> prompt)
-  E edit        Edit the selected job's prompt in $EDITOR
-  L log         Tail (running) or page (completed) the job's log file
-  T reschedule  Change when the selected job runs
-  C session     Change the selected job's session id
-  U unschedule  Remove from at(1) but keep metadata
-  S submit      Submit or repair the selected job
-  R retry       Reschedule a completed/failed job
-  D delete      Permanently delete the selected job
-  F filter      Cycle: all / active / completed
-  G refresh     Reload from disk now (auto every 30s)
-  V detail      Toggle detail pane (narrow mode)
-  ? help        Toggle this help view
-  Q quit        Exit the jobs screen
+  N new          Create a job (agent -> session -> schedule -> prompt)
+  Y duplicate    Duplicate selected job (reuse agent/session, edit prompt)
+  E edit         Edit the selected job's prompt in $EDITOR
+  L log          Tail (running) or page (completed) the job's log file
+  P prefix       Edit the prompt prefix for Claude or Codex ($EDITOR)
+  T reschedule   Change when the selected job runs
+  C session      Change the selected job's session id
+  U unschedule   Remove from at(1) but keep metadata (confirmed)
+  S submit       Submit or repair the selected job
+  R retry        Reschedule a completed/failed job
+  D delete       Permanently delete the selected job
+  F filter       Cycle: all / active / completed
+  G refresh      Reload from disk now (auto every 30s)
+  V detail       Toggle detail pane (narrow mode)
+  / search       Filter by title substring (Esc clears)
+  Home/End       Jump to first/last job
+  PgUp/PgDn      Page up/down
+  ? help         Toggle this help view
+  Q quit         Exit the jobs screen
 """
 
 
@@ -816,12 +947,16 @@ def jobs_menu() -> int:
         return _layout_mode(_terminal_width())
 
     # ---------- overlay openers ----------
-    def open_confirm(prompt: str, on_confirm: Callable[[bool], str | None]) -> None:
+    def open_confirm(
+        prompt: str,
+        on_confirm: Callable[[bool], str | None],
+        default: bool = False,
+    ) -> None:
         state.overlay = OverlayState(
             kind="confirm",
             prompt=prompt,
             on_confirm=on_confirm,
-            default=False,
+            default=default,
         )
 
     def open_input(
@@ -929,6 +1064,28 @@ def jobs_menu() -> int:
         run_in_terminal(_suspend_and_view)
         return None
 
+    def action_edit_prefix(agent: str) -> str | None:
+        path = ensure_prompt_prefix(agent)
+
+        def _suspend_and_edit() -> None:
+            try:
+                edit_file(path)
+                state.message = f"Updated {agent} prompt prefix."
+            except Exception as exc:  # noqa: BLE001
+                state.message = f"error: {exc}"
+            state.refresh_jobs()
+
+        run_in_terminal(_suspend_and_edit)
+        return None
+
+    def start_prefix_edit_flow() -> None:
+        items = [(cfg["label"], key) for key, cfg in AGENTS.items()]
+        open_picker(
+            "Edit prompt prefix: pick agent",
+            items,
+            on_pick=lambda agent: action_edit_prefix(agent),
+        )
+
     def action_edit_prompt(job: dict) -> str | None:
         path = Path(job["prompt_file"])
         if not path.exists():
@@ -975,58 +1132,27 @@ def jobs_menu() -> int:
         return f"Created {job['id']} (not submitted)."
 
     # ---------- schedule picker (generic) ----------
-    # A three-stage constrained flow; result is a schedule spec string that
-    # resolve_schedule_input accepts. `on_spec(spec)` is called once the user
-    # has finished picking. Callers: new-job, reschedule, retry.
+    # Two-stage constrained flow: pick HH, then pick MM (in 5-min steps).
+    # The (hh, mm) pair is interpreted as an offset from now and converted
+    # to a spec string that resolve_schedule_input accepts. `on_spec(spec)`
+    # is called once the user has finished picking. Callers: new-job,
+    # reschedule, retry.
     def schedule_picker_start(prompt_prefix: str, on_spec: Callable[[str], str | None]) -> None:
-        items = [("Offset from now", "offset"), ("Specific time", "time")]
-        open_picker(
-            f"{prompt_prefix}: pick mode",
-            items,
-            on_pick=lambda mode: _schedule_picker_mode(prompt_prefix, mode, on_spec),
-        )
-
-    def _schedule_picker_mode(
-        prompt_prefix: str,
-        mode: str,
-        on_spec: Callable[[str], str | None],
-    ) -> str | None:
         hour_items = [(f"{h:02d}", h) for h in range(24)]
-        if mode == "offset":
-            open_picker(
-                f"{prompt_prefix}: offset hours",
-                hour_items,
-                on_pick=lambda hour: _schedule_pick_offset_minute(prompt_prefix, hour, on_spec),
-            )
-            return None
         open_picker(
-            f"{prompt_prefix}: hour",
+            f"{prompt_prefix}: hours from now",
             hour_items,
-            on_pick=lambda hour: _schedule_pick_time_minute(prompt_prefix, hour, on_spec),
+            on_pick=lambda hour: _schedule_pick_minute(prompt_prefix, hour, on_spec),
         )
-        return None
 
-    def _schedule_pick_time_minute(
+    def _schedule_pick_minute(
         prompt_prefix: str,
         hour: int,
         on_spec: Callable[[str], str | None],
     ) -> str | None:
         items = [(f"{m:02d}", m) for m in range(0, 60, 5)]
         open_picker(
-            f"{prompt_prefix}: minute",
-            items,
-            on_pick=lambda minute: on_spec(_resolve_time_pick(hour, minute)),
-        )
-        return None
-
-    def _schedule_pick_offset_minute(
-        prompt_prefix: str,
-        hour: int,
-        on_spec: Callable[[str], str | None],
-    ) -> str | None:
-        items = [(f"{m:02d}", m) for m in range(0, 60, 5)]
-        open_picker(
-            f"{prompt_prefix}: offset minutes",
+            f"{prompt_prefix}: minutes from now",
             items,
             on_pick=lambda minute: on_spec(_resolve_offset_pick(hour, minute)),
         )
@@ -1068,11 +1194,19 @@ def jobs_menu() -> int:
             title = session.title or "[no title]"
             label = f"{title} [{session.id[:8]}]"
             items.append((label, session.id))
-        open_picker(
-            "New job: pick session",
-            items,
-            on_pick=lambda value: _nj_picked_session(form, value),
-        )
+        items.append((PASTE_SESSION_LABEL, PASTE_SESSION_LABEL))
+
+        def on_pick(value: Any) -> str | None:
+            if value == PASTE_SESSION_LABEL:
+                open_input(
+                    "Paste session ID",
+                    "",
+                    lambda pasted: _nj_picked_session(form, pasted.strip() or None),
+                )
+                return None
+            return _nj_picked_session(form, value)
+
+        open_picker("New job: pick session", items, on_pick=on_pick)
 
     def _nj_picked_session(form: dict, session_id: str | None) -> str | None:
         form["session_id"] = session_id
@@ -1095,9 +1229,11 @@ def jobs_menu() -> int:
         # that happens after the editor exits. When the editor closes, we
         # arm the submit-confirm overlay so it appears as soon as the TUI
         # redraws.
+        initial = form.get("prompt", "") or ""
+
         def _suspend_and_capture() -> None:
             try:
-                text = read_prompt()
+                text = read_prompt(initial=initial)
             except KeyboardInterrupt:
                 state.message = "New job cancelled."
                 state.refresh_jobs()
@@ -1120,15 +1256,71 @@ def jobs_menu() -> int:
         form["submit"] = submit
         return action_create_job(form)
 
+    def start_duplicate_job_flow(job: dict) -> None:
+        """Duplicate selected job: reuse agent/session, pre-fill prompt, pick schedule."""
+        try:
+            existing_prompt = Path(job["prompt_file"]).read_text(encoding="utf-8")
+        except Exception:
+            existing_prompt = ""
+        form: dict = {
+            "agent": job.get("agent"),
+            "session_id": job.get("session_id"),
+            "schedule_spec": "now + 5 minutes",
+            "prompt": existing_prompt,
+            "cwd": job.get("cwd") or str(Path.cwd()),
+        }
+        _nj_pick_schedule(form)
+
     # ---------- rendering ----------
+    _COUNT_ORDER = [
+        ("Q", "queued"),
+        ("S", "scheduled"),
+        ("R", "running"),
+        ("W", "waiting"),
+        ("B", "blocked"),
+        ("C", "completed"),
+        ("F", "failed"),
+        ("X", "removed"),
+        ("!", "invalid"),
+    ]
+
+    def _status_counts_text() -> str:
+        counts: dict[str, int] = {}
+        for job in state.cached_jobs:
+            key = job.get("display_state") or "invalid"
+            counts[key] = counts.get(key, 0) + 1
+        parts = [
+            f"{letter}:{counts.get(state_key, 0)}"
+            for letter, state_key in _COUNT_ORDER
+            if counts.get(state_key, 0) > 0
+        ]
+        return " ".join(parts) if parts else "empty"
+
     def header_fragments():
         timezone = datetime.now().astimezone().tzname() or "local"
         count = len(state.cached_jobs)
+        counts_text = _status_counts_text()
         text = (
             f" Jobs   Filter: {state.filter.title()}   "
-            f"TZ: {timezone}   {count} item{'s' if count != 1 else ''} "
+            f"TZ: {timezone}   {count} item{'s' if count != 1 else ''}   "
+            f"[{counts_text}]"
         )
+        if state.search_query:
+            text += f"   Search: {state.search_query} ({count})"
+        text += " "
         return [("class:header", text)]
+
+    def _visible_row_budget() -> int:
+        try:
+            term_lines = _shutil.get_terminal_size(fallback=(80, 24)).lines
+        except Exception:
+            term_lines = 24
+        # header(1) + footer(2) + table-header(1)
+        reserved = 4
+        if _layout_mode_now() == "narrow" and (state.show_detail or state.show_help):
+            # detail stacked under summary → roughly halve remaining space
+            return max(3, (term_lines - reserved - 1) // 2)
+        return max(3, term_lines - reserved)
 
     def summary_fragments():
         mode = _layout_mode_now()
@@ -1139,10 +1331,27 @@ def jobs_menu() -> int:
         fragments.append(("class:table-header", render_summary_header(columns) + "\n"))
 
         if not state.cached_jobs:
-            fragments.append(("class:muted", "No jobs.\n"))
+            if state.search_query:
+                msg = f"No jobs match '{state.search_query}'. Press / to edit, Esc to clear.\n"
+            else:
+                msg = "No jobs. Press N to create one.\n"
+            fragments.append(("class:muted", msg))
             return fragments
 
-        for index, job in enumerate(state.cached_jobs):
+        n = len(state.cached_jobs)
+        budget = _visible_row_budget()
+        if n <= budget:
+            start, end = 0, n
+        else:
+            start = max(0, state.selected - budget // 2)
+            start = min(start, n - budget)
+            end = start + budget
+
+        if start > 0:
+            fragments.append(("class:muted", f"  ... {start} above\n"))
+
+        for index in range(start, end):
+            job = state.cached_jobs[index]
             selected = index == state.selected
             # Selected row uses the reverse-video selected style uniformly so
             # the highlight stays legible; everything else is either normal
@@ -1163,13 +1372,22 @@ def jobs_menu() -> int:
                     fragments.append((row_style, padded))
                 fragments.append((row_style, " "))
             fragments.append((row_style, "\n"))
+
+        if end < n:
+            fragments.append(("class:muted", f"  ... {n - end} below\n"))
         return fragments
 
     def detail_fragments():
         if state.show_help:
             return [("", HELP_TEXT)]
         job = state.current_job()
-        return [("", render_detail(job) + "\n")]
+        fragments: list[tuple[str, str]] = []
+        if job is not None and job.get("display_state") == "running":
+            elapsed = _elapsed_since(job.get("last_started_at"))
+            if elapsed:
+                fragments.append(("class:status-running", f"{elapsed}\n\n"))
+        fragments.append(("", render_detail(job) + "\n"))
+        return fragments
 
     def _maybe_dismiss_help() -> None:
         if state.show_help:
@@ -1177,8 +1395,10 @@ def jobs_menu() -> int:
 
     _HELP_HINT_PAIRS: list[tuple[str, str]] = [
         ("N", "ew"),
-        ("E", "dit prompt"),
+        ("Y", " dup"),
+        ("E", "dit"),
         ("L", "og"),
+        ("P", "refix"),
         ("T", " time"),
         ("C", " session"),
         ("U", "nschedule"),
@@ -1186,6 +1406,7 @@ def jobs_menu() -> int:
         ("R", "etry"),
         ("D", "elete"),
         ("F", "ilter"),
+        ("/", " search"),
         ("G", " refresh"),
         ("V", " detail"),
         ("?", " help"),
@@ -1446,6 +1667,11 @@ def jobs_menu() -> int:
             return
         _dispatch_action(state, lambda: action_edit_prompt(job))
 
+    @kb.add("p", filter=no_overlay)
+    def _prefix(event):
+        _maybe_dismiss_help()
+        start_prefix_edit_flow()
+
     @kb.add("l", filter=no_overlay)
     def _log(event):
         _maybe_dismiss_help()
@@ -1480,11 +1706,19 @@ def jobs_menu() -> int:
             title = session.title or "[no title]"
             label = f"{title} [{session.id[:8]}]"
             items.append((label, session.id))
-        open_picker(
-            f"Session for {job['id']}",
-            items,
-            on_pick=lambda session_id: action_change_session(job, session_id),
-        )
+        items.append((PASTE_SESSION_LABEL, PASTE_SESSION_LABEL))
+
+        def on_pick(value: Any) -> str | None:
+            if value == PASTE_SESSION_LABEL:
+                open_input(
+                    "Paste session ID",
+                    "",
+                    lambda pasted: action_change_session(job, pasted.strip() or None),
+                )
+                return None
+            return action_change_session(job, value)
+
+        open_picker(f"Session for {job['id']}", items, on_pick=on_pick)
 
     @kb.add("u", filter=no_overlay)
     def _unschedule(event):
@@ -1493,7 +1727,13 @@ def jobs_menu() -> int:
         if not job:
             state.message = "No job selected."
             return
-        _dispatch_action(state, lambda: action_unschedule(job))
+
+        def on_confirm(answered: bool) -> str | None:
+            if not answered:
+                return "Unschedule cancelled."
+            return action_unschedule(job)
+
+        open_confirm(f"Remove {job['id']} from queue?", on_confirm)
 
     @kb.add("s", filter=no_overlay)
     def _submit(event):
@@ -1538,6 +1778,66 @@ def jobs_menu() -> int:
 
         open_confirm(f"Delete {job['id']} permanently?", on_confirm)
 
+    def _page_size() -> int:
+        try:
+            term_lines = _shutil.get_terminal_size(fallback=(80, 24)).lines
+        except Exception:
+            term_lines = 24
+        return max(1, term_lines - 6)
+
+    @kb.add("home", filter=no_overlay)
+    def _home(event):
+        _maybe_dismiss_help()
+        if state.cached_jobs:
+            state.selected = 0
+
+    @kb.add("end", filter=no_overlay)
+    def _end(event):
+        _maybe_dismiss_help()
+        if state.cached_jobs:
+            state.selected = len(state.cached_jobs) - 1
+
+    @kb.add("pageup", filter=no_overlay)
+    def _pageup(event):
+        _maybe_dismiss_help()
+        if state.cached_jobs:
+            state.selected = max(0, state.selected - _page_size())
+
+    @kb.add("pagedown", filter=no_overlay)
+    def _pagedown(event):
+        _maybe_dismiss_help()
+        if state.cached_jobs:
+            state.selected = min(len(state.cached_jobs) - 1, state.selected + _page_size())
+
+    @kb.add("/", filter=no_overlay)
+    def _search(event):
+        _maybe_dismiss_help()
+
+        def on_submit(value: str) -> str | None:
+            state.search_query = value.strip()
+            state.refresh_jobs()
+            if state.search_query:
+                return f"Search: {state.search_query}"
+            return "Search cleared."
+
+        open_input("Search (empty to clear)", state.search_query, on_submit)
+
+    @kb.add("escape", filter=no_overlay)
+    def _clear_search(event):
+        if state.search_query:
+            state.search_query = ""
+            state.refresh_jobs()
+            state.message = "Search cleared."
+
+    @kb.add("y", filter=no_overlay)
+    def _duplicate(event):
+        _maybe_dismiss_help()
+        job = state.current_job()
+        if not job:
+            state.message = "No job selected."
+            return
+        start_duplicate_job_flow(job)
+
     @kb.add("c-c")
     def _ctrl_c(event):
         state.quit = True
@@ -1563,6 +1863,7 @@ def jobs_menu() -> int:
     detail_window = Window(
         content=FormattedTextControl(detail_fragments),
         wrap_lines=True,
+        width=Dimension(preferred=60, max=80, min=30),
     )
     picker_window = Window(
         content=FormattedTextControl(picker_fragments),
