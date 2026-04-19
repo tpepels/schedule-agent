@@ -113,6 +113,37 @@ def test_choose_session_prefers_current_claude_project(app_modules, monkeypatch,
     assert selected == "preferred"
 
 
+def test_discover_codex_sessions_skips_subagent_rollouts(app_modules, monkeypatch, tmp_path):
+    cli = app_modules.cli
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = tmp_path / ".codex" / "sessions"
+
+    top = root / "2026" / "04" / "18" / "rollout-top.jsonl"
+    sub = root / "2026" / "04" / "18" / "rollout-sub.jsonl"
+
+    _write_jsonl(
+        top,
+        {"type": "session_meta", "payload": {"id": "top", "source": "exec"}},
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "Top"}},
+    )
+    _write_jsonl(
+        sub,
+        {
+            "type": "session_meta",
+            "payload": {
+                "id": "sub",
+                "source": {"subagent": {"thread_spawn": {"parent_thread_id": "top"}}},
+            },
+        },
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "Sub"}},
+    )
+
+    sessions = cli._discover_codex_sessions(limit=10)
+    ids = [s.id for s in sessions]
+    assert "rollout-top" in ids
+    assert "rollout-sub" not in ids
+
+
 def test_read_prompt_uses_editor_output_and_cleans_up_tempfile(app_modules, monkeypatch):
     cli = app_modules.cli
     seen = {}

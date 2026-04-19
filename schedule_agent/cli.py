@@ -215,6 +215,28 @@ def extract_session_title(path: str, agent: str) -> str | None:
     return None
 
 
+def _codex_session_is_subagent(path: Path) -> bool:
+    """True when the first `session_meta` row marks this file as a subagent.
+
+    Codex writes `payload.source = {"subagent": {...}}` for sessions spawned
+    via its subagent mechanism; top-level sessions use a string ('exec',
+    'cli', 'vscode'). These subagent rollouts cannot be resumed meaningfully,
+    so they are hidden from the picker.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            first = handle.readline()
+    except OSError:
+        return False
+    try:
+        record = json.loads(first)
+    except (ValueError, TypeError):
+        return False
+    payload = record.get("payload") or {}
+    source = payload.get("source")
+    return isinstance(source, dict) and "subagent" in source
+
+
 def _safe_mtime(path: Path) -> float:
     try:
         return path.stat().st_mtime
@@ -230,6 +252,7 @@ def _discover_codex_sessions(limit: int) -> list[SessionInfo]:
         files = [path for path in root.rglob("*.jsonl") if path.is_file()]
     except OSError:
         return []
+    files = [p for p in files if not _codex_session_is_subagent(p)]
     files.sort(key=_safe_mtime, reverse=True)
     return [
         SessionInfo(
