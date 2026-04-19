@@ -1,6 +1,27 @@
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _bypass_preflight(monkeypatch, app_modules):
+    """Skip real claude/codex/at probing in operations tests."""
+    from schedule_agent import environment, preflight
+
+    probe = environment.AgentProbe(
+        agent="claude",
+        resolved_path="/fake/claude",
+        version="2.1.112",
+        version_known_good=True,
+        help_ok=True,
+        error=None,
+    )
+    report = preflight.PreflightReport(results=[])
+    monkeypatch.setattr(
+        app_modules.operations,
+        "_submit_preflight",
+        lambda agent: (report, probe),
+    )
+
+
 def _base_job(app_modules):
     return app_modules.transitions.make_job(
         job_id="job1",

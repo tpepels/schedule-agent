@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import fcntl
+import os
 import shutil
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from . import environment, preflight
 from .persistence import (
     _data_home,
     _ensure_dirs,
@@ -263,6 +265,38 @@ def _apply_scheduler_mutation(
         return MutationResult(job=updated)
 
 
+def _submit_preflight(agent: str) -> tuple[preflight.PreflightReport, environment.AgentProbe]:
+    """Run the submit-time preflight subset and probe the agent once.
+
+    Returning the probe avoids re-running `--version` when we build provenance.
+    """
+    probe = environment.probe_agent(agent)
+    results = [
+        preflight.check_at_binary(),
+        preflight.check_xdg_dirs(),
+        preflight.check_agent(agent, probe),
+    ]
+    return preflight.PreflightReport(results=results), probe
+
+
+def _build_provenance(
+    probe: environment.AgentProbe, report: preflight.PreflightReport
+) -> dict:
+    raw_path = os.environ.get("PATH", "")
+    cleaned = environment.capture_path(raw_path)
+    return {
+        "submitted_at": now_iso(),
+        "agent_path": probe.resolved_path,
+        "agent_version": probe.version,
+        "path_snapshot_raw": raw_path,
+        "path_snapshot_cleaned": cleaned,
+        "preflight": {
+            "critical_ok": report.critical_ok(),
+            "warnings": [r.message for r in report.warnings()],
+        },
+    }
+
+
 def create_job(
     agent: str,
     session_mode: str,
@@ -273,6 +307,11 @@ def create_job(
     submit: bool = True,
 ) -> dict:
     with _locked_queue():
+        report, probe = _submit_preflight(agent)
+        if not report.critical_ok():
+            fail = report.critical_failures()[0]
+            raise OperationError(f"Preflight failed: {fail.label}: {fail.message}")
+
         job_id = _job_id(agent)
         scheduled_for = resolve_schedule_spec(schedule_spec)
         prompt_file = write_prompt_file(_prompt_dir(), job_id, prompt_text)
@@ -287,6 +326,7 @@ def create_job(
             cwd=cwd,
             log_dir=job_log_dir(job_id),
         )
+        job["provenance"] = _build_provenance(probe, report)
         jobs = load_jobs()
         jobs.append(job)
         save_jobs(jobs)
