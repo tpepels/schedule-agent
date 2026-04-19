@@ -11,6 +11,7 @@ def _agent_bin(job: dict, cfg: dict) -> str:
     provenance = job.get("provenance") or {}
     return provenance.get("agent_path") or cfg["bin"]
 
+
 AGENTS: dict[str, dict] = {
     "codex": {
         "label": "Codex",

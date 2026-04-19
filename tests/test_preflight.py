@@ -327,9 +327,7 @@ def test_run_checks_order_and_no_roundtrip(monkeypatch):
         return _cr(f"session_dir_{agent}")
 
     monkeypatch.setattr(preflight, "check_session_dir", fake_session)
-    monkeypatch.setattr(
-        preflight, "check_at_roundtrip", lambda: _cr("at_roundtrip")
-    )
+    monkeypatch.setattr(preflight, "check_at_roundtrip", lambda: _cr("at_roundtrip"))
 
     report = preflight.run_checks()
     names = [r.name for r in report.results]

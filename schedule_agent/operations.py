@@ -279,9 +279,7 @@ def _submit_preflight(agent: str) -> tuple[preflight.PreflightReport, environmen
     return preflight.PreflightReport(results=results), probe
 
 
-def _build_provenance(
-    probe: environment.AgentProbe, report: preflight.PreflightReport
-) -> dict:
+def _build_provenance(probe: environment.AgentProbe, report: preflight.PreflightReport) -> dict:
     raw_path = os.environ.get("PATH", "")
     cleaned = environment.capture_path(raw_path)
     return {

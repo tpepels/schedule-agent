@@ -90,9 +90,7 @@ def probe_agent(agent: str) -> AgentProbe:
         error = str(exc)
         version = None
 
-    version_known_good = (
-        version is not None and version in KNOWN_GOOD_AGENT_VERSIONS[agent]
-    )
+    version_known_good = version is not None and version in KNOWN_GOOD_AGENT_VERSIONS[agent]
 
     help_ok = False
     try:

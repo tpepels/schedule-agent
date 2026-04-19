@@ -64,9 +64,7 @@ def test_capture_path_appends_floor_without_duplicates(tmp_path, monkeypatch):
     floor2 = tmp_path / "floor2"
     floor1.mkdir()
     floor2.mkdir()
-    monkeypatch.setattr(
-        environment, "PATH_FLOOR", [str(floor1), str(floor2)]
-    )
+    monkeypatch.setattr(environment, "PATH_FLOOR", [str(floor1), str(floor2)])
     raw = str(floor1)
     result = capture_path(raw)
     assert result == [str(floor1), str(floor2)]

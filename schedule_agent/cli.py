@@ -275,9 +275,7 @@ def _discover_claude_sessions(cwd: Path | None, limit: int) -> list[SessionInfo]
     def top_level_jsonl(project_dir: Path) -> list[tuple[Path, str]]:
         try:
             return [
-                (path, project_dir.name)
-                for path in project_dir.glob("*.jsonl")
-                if path.is_file()
+                (path, project_dir.name) for path in project_dir.glob("*.jsonl") if path.is_file()
             ]
         except OSError:
             return []
@@ -332,8 +330,7 @@ def _prompt_paste_session_id() -> str | None:
         from prompt_toolkit.shortcuts import input_dialog
     except ModuleNotFoundError as exc:
         raise OperationError(
-            "prompt_toolkit is required for the interactive UI. "
-            "Install project dependencies first."
+            "prompt_toolkit is required for the interactive UI. Install project dependencies first."
         ) from exc
     result = input_dialog(
         title=APP_NAME,
@@ -347,9 +344,11 @@ def _prompt_paste_session_id() -> str | None:
 
 def choose_session(agent: str, cwd: Path | None = None) -> str | None:
     sessions = discover_sessions(agent, cwd=cwd)
-    labels = ["New session"] + [
-        f"{(session.title or '[no title]')} [{session.id[:8]}]" for session in sessions
-    ] + [PASTE_SESSION_LABEL]
+    labels = (
+        ["New session"]
+        + [f"{(session.title or '[no title]')} [{session.id[:8]}]" for session in sessions]
+        + [PASTE_SESSION_LABEL]
+    )
 
     selected = choose("Session", labels, default="New session")
     if selected == "New session":
@@ -2063,12 +2062,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Emit the report as JSON instead of the human table.",
     )
     verbosity = doctor_p.add_mutually_exclusive_group()
-    verbosity.add_argument(
-        "--verbose", action="store_true", help="Include PASS/SKIP details."
-    )
-    verbosity.add_argument(
-        "--quiet", action="store_true", help="Only show WARN/FAIL rows."
-    )
+    verbosity.add_argument("--verbose", action="store_true", help="Include PASS/SKIP details.")
+    verbosity.add_argument("--quiet", action="store_true", help="Only show WARN/FAIL rows.")
 
     return parser
 
