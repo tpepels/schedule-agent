@@ -6,12 +6,6 @@ from pathlib import Path
 APP_NAME = "schedule-agent"
 
 DEFAULT_PROMPT_PREFIX = """\
-# Scheduled-agent prompt prefix
-
-This file is prepended to every prompt sent to the agent by schedule-agent.
-It is read at run time, so edits take effect on the next invocation of any
-queued job. Delete the file to regenerate the default on next run.
-
 You are executing a scheduled task autonomously. Work from the task prompt
 below. When you finish, summarise what was done in the final message.
 """
