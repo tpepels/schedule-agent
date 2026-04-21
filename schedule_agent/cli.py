@@ -612,6 +612,8 @@ class OverlayState:
 class JobsScreenState:
     selected: int = 0
     filter: str = "all"
+    scope: str = "project"  # "project" (cwd-only) or "all"
+    cwd: str = field(default_factory=lambda: str(Path.cwd()))
     message: str = ""
     quit: bool = False
     cached_jobs: list[dict] = field(default_factory=list)
@@ -623,6 +625,8 @@ class JobsScreenState:
 
     def refresh_jobs(self) -> None:
         jobs, atq_error = list_job_views(self.filter)
+        if self.scope == "project":
+            jobs = [j for j in jobs if (j.get("cwd") or "") == self.cwd]
         if self.search_query:
             needle = self.search_query.lower()
             jobs = [j for j in jobs if needle in (j.get("title") or "").lower()]
@@ -928,7 +932,8 @@ Actions
   S submit       Submit or repair the selected job
   R retry        Reschedule a completed/failed job
   D delete       Permanently delete the selected job
-  F filter       Cycle: all / active / completed
+  f filter       Cycle: all / active / completed
+  F scope        Toggle project (cwd) / all projects
   G refresh      Reload from disk now (auto every 30s)
   V detail       Toggle detail pane (narrow mode)
   / search       Filter by title substring (Esc clears)
@@ -1322,8 +1327,9 @@ def jobs_menu() -> int:
         timezone = datetime.now().astimezone().tzname() or "local"
         count = len(state.cached_jobs)
         counts_text = _status_counts_text()
+        scope_label = "Project" if state.scope == "project" else "All"
         text = (
-            f" Jobs   Filter: {state.filter.title()}   "
+            f" Jobs   Scope: {scope_label}   Filter: {state.filter.title()}   "
             f"TZ: {timezone}   {count} item{'s' if count != 1 else ''}   "
             f"[{counts_text}]"
         )
@@ -1427,7 +1433,8 @@ def jobs_menu() -> int:
         ("S", "ubmit"),
         ("R", "etry"),
         ("D", "elete"),
-        ("F", "ilter"),
+        ("f", "ilter"),
+        ("F", " scope"),
         ("/", " search"),
         ("G", " refresh"),
         ("V", " detail"),
@@ -1654,6 +1661,15 @@ def jobs_menu() -> int:
         state.selected = 0
         state.refresh_jobs()
         state.message = f"Filter: {state.filter}."
+
+    @kb.add("F", filter=no_overlay)
+    def _cycle_scope(event):
+        _maybe_dismiss_help()
+        state.scope = "all" if state.scope == "project" else "project"
+        state.selected = 0
+        state.refresh_jobs()
+        label = "project (cwd)" if state.scope == "project" else "all projects"
+        state.message = f"Scope: {label}."
 
     @kb.add("g", filter=no_overlay)
     def _refresh(event):
