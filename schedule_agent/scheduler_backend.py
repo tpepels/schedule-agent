@@ -6,7 +6,9 @@ import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
+from .config import load_prompt_prefix
 from .execution import build_agent_cmd
 from .time_utils import (
     iso_to_at_time,
@@ -60,8 +62,36 @@ def parse_atq_line(line: str) -> AtqEntry | None:
     )
 
 
+def _write_prefix_snapshot(job: dict) -> str | None:
+    """Freeze the current prompt prefix into the job's log_dir.
+
+    Returns the snapshot path, or None if no prefix is configured. The
+    snapshot is written with 0600 perms since it may contain sensitive
+    user instructions.
+    """
+    log_dir = job.get("log_dir")
+    if not log_dir:
+        return None
+    content = load_prompt_prefix(job["agent"])
+    snapshot_dir = Path(log_dir)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = snapshot_dir / "prefix.snapshot"
+    snapshot_path.write_text(content, encoding="utf-8")
+    try:
+        os.chmod(snapshot_path, 0o600)
+    except OSError:
+        pass
+    return str(snapshot_path)
+
+
 def build_script(job: dict) -> str:
-    cmd = build_agent_cmd(job)
+    # Snapshot the prompt prefix at submit time. Mutating the job dict
+    # locally (not persisting) means build_script is idempotent while the
+    # at-script stably references an immutable per-job snapshot path.
+    snapshot_path = _write_prefix_snapshot(job)
+    job_with_snapshot = dict(job)
+    job_with_snapshot["prefix_snapshot_file"] = snapshot_path
+    cmd = build_agent_cmd(job_with_snapshot)
     sa_bin = shlex.quote(shutil.which("schedule-agent") or "schedule-agent")
     provenance = job.get("provenance") or {}
     path_entries = provenance.get("path_snapshot_cleaned") or DEFAULT_PATH_ENTRIES
@@ -120,6 +150,13 @@ def submit_job(job: dict, dry_run: bool = False) -> tuple[str | None, str]:
 
 
 def remove_at_job(at_job_id: str) -> tuple[bool, str]:
+    # Consult atq first: if the id is not present, treat as already-gone
+    # rather than calling atrm on a potentially-reused id. atq -o format
+    # preserves the id's owner so a simple presence check is sufficient —
+    # atrm only acts on the invoking user's jobs.
+    entry, query_err = query_atq_entry(str(at_job_id))
+    if entry is None and not query_err:
+        return True, ""
     proc = _run_at(
         ["atrm", str(at_job_id)],
         capture_output=True,

@@ -1,3 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 check_atd_running() {
   if pgrep -x atd >/dev/null 2>&1; then
     return 0
@@ -12,7 +15,6 @@ check_atd_running() {
   exit 1
 }
 
-check_atd_running
 check_prereq() {
   local cmd="$1"
   local pkg="$2"
@@ -22,30 +24,27 @@ check_prereq() {
   fi
 }
 
-# Check prerequisites
+check_atd_running
 
-# Find a suitable Python 3 interpreter (>=3.7)
+# Find a suitable Python 3 interpreter (>=3.10)
 PYTHON_BIN=""
 for candidate in python3 python; do
   if command -v "$candidate" >/dev/null 2>&1; then
     ver=$($candidate -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)
     case "$ver" in
-      3.[7-9]|3.1[0-9]|[4-9].*)
+      3.1[0-9]|3.[2-9][0-9]|[4-9].*)
         PYTHON_BIN="$candidate"; break;;
     esac
   fi
 done
 if [[ -z "$PYTHON_BIN" ]]; then
-  echo "Error: Python 3.7+ is required (python3 or python not found or too old)." >&2
+  echo "Error: Python 3.10+ is required (python3 or python not found or too old)." >&2
   exit 1
 fi
 
 check_prereq pip3 "pip for Python 3"
 check_prereq at "at (job scheduler)"
 check_prereq atd "atd (daemon)"
-
-#!/usr/bin/env bash
-set -e
 
 PREFIX="${HOME}/.local"
 BIN_DIR="${PREFIX}/bin"
@@ -58,7 +57,6 @@ is_installed() {
   if [[ -x "$SCHEDULE_AGENT_BIN" ]]; then
     return 0
   fi
-  # Also check if installed via pip in user or system
   if "$PYTHON_BIN" -m pip show schedule-agent >/dev/null 2>&1; then
     return 0
   fi
@@ -68,16 +66,13 @@ is_installed() {
 if is_installed; then
   echo "schedule-agent is already installed."
   echo "Updating to the latest version..."
-  # Try to update via pip if installed as a package
   if "$PYTHON_BIN" -m pip show schedule-agent >/dev/null 2>&1; then
     "$PYTHON_BIN" -m pip install --upgrade --user schedule-agent
     echo "schedule-agent updated via pip."
     exit 0
   fi
-  # Otherwise, update the local install (reinstall files)
   echo "Updating local install..."
   rm -rf "$APP_DIR/schedule_agent" "$APP_DIR/pyproject.toml" "$VENV_DIR"
-  # Continue to install as below
 else
   echo "schedule-agent not found. Installing..."
 fi
@@ -85,20 +80,16 @@ fi
 mkdir -p "$BIN_DIR"
 mkdir -p "$APP_DIR"
 
-# Copy project files
 cp -r schedule_agent "$APP_DIR/"
 cp pyproject.toml "$APP_DIR/"
 cp README.md "$APP_DIR/" 2>/dev/null || true
 cp LICENSE "$APP_DIR/" 2>/dev/null || true
 
-# Create venv
 "$PYTHON_BIN" -m venv "$VENV_DIR"
 
-# Install package into the venv
 "$VENV_DIR/bin/pip" install --upgrade pip
 "$VENV_DIR/bin/pip" install "$APP_DIR"
 
-# Create launcher
 cat > "$BIN_DIR/schedule-agent" <<EOF
 #!/usr/bin/env bash
 exec "$VENV_DIR/bin/schedule-agent" "\$@"

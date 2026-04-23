@@ -30,6 +30,13 @@ def _ensure_dirs() -> tuple[Path, Path, Path, Path, Path]:
     data_dir.mkdir(parents=True, exist_ok=True)
     prompt_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
+    # Logs and prompts may contain agent-generated secrets. Tighten perms
+    # to 0700 so other local users can't read under lax home-dir modes.
+    for sensitive in (logs_dir, prompt_dir, state_dir):
+        try:
+            os.chmod(sensitive, 0o700)
+        except OSError:
+            pass
     return state_dir, data_dir, prompt_dir, logs_dir, queue_file
 
 
@@ -104,12 +111,18 @@ def load_jobs() -> list[dict]:
 
 
 def save_jobs(jobs: list[dict]) -> None:
+    # Atomic write: a crash mid-write must never leave a torn queue file
+    # behind. Write to a sibling tempfile, fsync, then os.replace onto the
+    # final path (POSIX-atomic rename within the same directory).
     queue_file = _queue_file()
     _ensure_dirs()
-    queue_file.write_text(
-        "\n".join(json.dumps(job, ensure_ascii=False) for job in jobs),
-        encoding="utf-8",
-    )
+    payload = "\n".join(json.dumps(job, ensure_ascii=False) for job in jobs)
+    tmp = queue_file.with_suffix(queue_file.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, queue_file)
 
 
 def find_job(jobs: list[dict], job_id: str) -> tuple[int, dict] | tuple[None, None]:

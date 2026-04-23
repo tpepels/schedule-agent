@@ -10,10 +10,11 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from . import preflight
 from .config import ensure_prompt_prefix
 from .execution import AGENTS, build_agent_cmd
 from .legacy import cli_state as legacy_cli_state
@@ -49,6 +50,17 @@ from .transitions import on_cancel
 
 APP_NAME = "schedule-agent"
 
+try:
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _pkg_version
+
+    try:
+        APP_VERSION = _pkg_version("schedule-agent")
+    except PackageNotFoundError:
+        APP_VERSION = "0.0.0+local"
+except Exception:
+    APP_VERSION = "0.0.0+local"
+
 load_state = legacy_cli_state.load_state
 save_state = legacy_cli_state.save_state
 set_state = legacy_cli_state.set_state
@@ -64,12 +76,28 @@ def _data_home_fn() -> Path:
     return _data_home()
 
 
-def _make_paths():
-    state_dir, data_dir, prompt_dir, _, queue_file = _ensure_dirs()
-    return state_dir, data_dir, queue_file, legacy_state_file(state_dir), prompt_dir
+# Path accessors are intentionally lazy — resolving them would mkdir XDG
+# dirs, which is a surprise side-effect at import time (breaks hermetic
+# tests and packagers that just `import schedule_agent.cli`). The names
+# below (STATE_DIR, DATA_DIR, QUEUE_FILE, STATE_FILE, PROMPT_DIR) remain
+# accessible as module attributes via __getattr__ for callers that grew
+# up with the old eager globals; the first access is what actually
+# touches the filesystem.
+_LAZY_PATHS = {"STATE_DIR", "DATA_DIR", "QUEUE_FILE", "STATE_FILE", "PROMPT_DIR"}
 
 
-STATE_DIR, DATA_DIR, QUEUE_FILE, STATE_FILE, PROMPT_DIR = _make_paths()
+def __getattr__(name):
+    if name in _LAZY_PATHS:
+        state_dir, data_dir, prompt_dir, _, queue_file = _ensure_dirs()
+        values = {
+            "STATE_DIR": state_dir,
+            "DATA_DIR": data_dir,
+            "QUEUE_FILE": queue_file,
+            "STATE_FILE": legacy_state_file(state_dir),
+            "PROMPT_DIR": prompt_dir,
+        }
+        return values[name]
+    raise AttributeError(name)
 
 
 def build_cmd(job: dict) -> str:
@@ -323,6 +351,10 @@ def discover_sessions(agent: str, cwd: Path | None = None, limit: int = 10) -> l
 
 
 PASTE_SESSION_LABEL = "Paste session ID..."
+# Sentinel value for "user picked the paste option" — distinct from any
+# session id string so a real session titled "Paste session ID..." can't
+# accidentally trigger the paste branch.
+PASTE_SESSION: object = object()
 
 
 def _prompt_paste_session_id() -> str | None:
@@ -361,6 +393,16 @@ def choose_session(agent: str, cwd: Path | None = None) -> str | None:
     return None
 
 
+def _session_picker_items(sessions: list[SessionInfo]) -> list[tuple[str, Any]]:
+    items: list[tuple[str, Any]] = [("New session", None)]
+    for session in sessions:
+        title = session.title or "[no title]"
+        label = f"{title} [{session.id[:8]}]"
+        items.append((label, session.id))
+    items.append((PASTE_SESSION_LABEL, PASTE_SESSION))
+    return items
+
+
 def read_prompt(initial: str = "") -> str:
     with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as handle:
         path = Path(handle.name)
@@ -377,8 +419,8 @@ def read_prompt(initial: str = "") -> str:
 
 
 def write_prompt_file(job_id: str, prompt: str) -> str:
-    _ensure_dirs()
-    return _write_prompt_file(PROMPT_DIR, job_id, prompt)
+    _, _, prompt_dir, _, _ = _ensure_dirs()
+    return _write_prompt_file(prompt_dir, job_id, prompt)
 
 
 def schedule(job: dict, dry_run: bool = False) -> str:
@@ -509,15 +551,26 @@ def cli_delete_job(job_id: str) -> int:
     return 0
 
 
-def cli_submit_job(job_id: str) -> int:
+def cli_submit_job(job_id: str, dry_run: bool = False) -> int:
     try:
-        job = submit_or_repair_job(job_id)
+        job = submit_or_repair_job(job_id, dry_run=dry_run)
     except OperationError as exc:
         print(f"error: {exc}")
         return 1
+    if dry_run:
+        print(f"{job_id}: dry-run (not submitted)")
+        print(job.get("_dry_run_preview", ""))
+        return 0
     print(f"{job_id}: submitted")
     print(f"  at_job_id: {job['at_job_id']}")
     print(f"  run_at:    {iso_to_display(job['scheduled_for'], with_seconds=True)}")
+    return 0
+
+
+def cli_edit_prefix(agent: str) -> int:
+    path = ensure_prompt_prefix(agent)
+    edit_file(path)
+    print(f"{agent}: prefix updated ({path})")
     return 0
 
 
@@ -658,7 +711,7 @@ class JobsScreenState:
 TITLE_MIN = 18
 TITLE_IDEAL = 28
 TITLE_MAX = 80
-STATUS_W = 10
+STATUS_W = 12
 RUN_AT_W = 28
 SESSION_W = 12
 UPDATED_W = 16
@@ -795,11 +848,30 @@ def _summary_columns(mode: str, total_width: int) -> list[tuple[str, int]]:
     ]
 
 
+STATUS_GLYPHS = {
+    "queued": ".",
+    "scheduled": "o",
+    "running": ">",
+    "waiting": "?",
+    "blocked": "!",
+    "completed": "+",
+    "failed": "x",
+    "removed": "-",
+    "invalid": "?",
+}
+
+
+def _status_with_glyph(job: dict) -> str:
+    state = job.get("display_state") or "invalid"
+    glyph = STATUS_GLYPHS.get(state, " ")
+    return f"{glyph} {job.get('display_label') or 'Invalid'}"
+
+
 def _column_value(job: dict, column: str) -> str:
     if column == "title":
         return job.get("title") or "(invalid)"
     if column == "status":
-        return job.get("display_label") or "Invalid"
+        return _status_with_glyph(job)
     if column == "run_at":
         base = iso_to_display(job.get("scheduled_for")) or "-"
         rel = _relative_time(job.get("scheduled_for"))
@@ -896,16 +968,27 @@ def _dispatch_action(
 
 
 # --- Schedule picker helpers ---------------------------------------------
-# The TUI scheduler is fully constrained: the user picks HH then MM (same
-# shape as a clock input) and we treat the result as an offset from now,
-# producing a string resolve_schedule_input accepts. Using an offset avoids
-# ambiguity around "specific time" drifting into the past by a few minutes.
+# The TUI scheduler is fully constrained: the user first picks a mode
+# (interval vs. absolute clock time), then HH, then MM. Each path produces
+# a string resolve_schedule_input accepts.
 def _resolve_offset_pick(hours: int, minutes: int) -> str:
     """Return a schedule spec for `now + HH:MM` as total minutes."""
     total = hours * 60 + minutes
     if total <= 0:
         total = 1
     return f"now + {total} minutes"
+
+
+def _resolve_clock_pick(hour: int, minute: int) -> str:
+    """Return a schedule spec for the next occurrence of HH:MM local time.
+
+    If HH:MM has already passed today, schedules for tomorrow instead.
+    """
+    now = datetime.now().astimezone()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target = target + timedelta(days=1)
+    return target.strftime("%Y-%m-%d %H:%M")
 
 
 HELP_TEXT = """\
@@ -921,21 +1004,18 @@ Statuses
   Invalid    On-disk metadata is broken
 
 Actions
-  N new          Create a job (agent -> session -> schedule -> prompt)
-  Y duplicate    Duplicate selected job (reuse agent/session, edit prompt)
+  A add          Create a job (agent -> session -> schedule -> prompt)
+  N now          Run the selected job immediately
+  R reschedule   Change when the selected job runs (also re-runs completed)
   E edit         Edit the selected job's prompt in $EDITOR
   L log          Tail (running) or page (completed) the job's log file
   P prefix       Edit the prompt prefix for Claude or Codex ($EDITOR)
-  T reschedule   Change when the selected job runs
   C session      Change the selected job's session id
   U unschedule   Remove from at(1) but keep metadata (confirmed)
   S submit       Submit or repair the selected job
-  R retry        Reschedule a completed/failed job
   D delete       Permanently delete the selected job
   f filter       Cycle: all / active / completed
   F scope        Toggle project (cwd) / all projects
-  G refresh      Reload from disk now (auto every 30s)
-  V detail       Toggle detail pane (narrow mode)
   / search       Filter by title substring (Esc clears)
   Home/End       Jump to first/last job
   PgUp/PgDn      Page up/down
@@ -945,7 +1025,7 @@ Actions
 
 
 # --- jobs_menu ------------------------------------------------------------
-def jobs_menu() -> int:
+def jobs_menu(dry_run: bool = False) -> int:
     toolkit = _require_prompt_toolkit()
     Application = toolkit["Application"]
     KeyBindings = toolkit["KeyBindings"]
@@ -1017,11 +1097,6 @@ def jobs_menu() -> int:
         updated = reschedule_job(job["id"], spec)
         run_at = iso_to_display(updated["scheduled_for"], with_seconds=True)
         return f"Rescheduled {job['id']} for {run_at}."
-
-    def action_retry(job: dict, spec: str) -> str:
-        updated = retry_job(job["id"], spec)
-        run_at = iso_to_display(updated["scheduled_for"], with_seconds=True)
-        return f"Retry scheduled {job['id']} for {run_at}."
 
     def action_change_session(job: dict, session_id: str | None) -> str:
         updated = change_session(job["id"], session_id)
@@ -1144,6 +1219,18 @@ def jobs_menu() -> int:
         prompt = form["prompt"]
         cwd = form.get("cwd") or str(Path.cwd())
         submit = form.get("submit", True)
+        if dry_run:
+            job = create_job(
+                agent=agent,
+                session_mode=session_mode,
+                session_id=session_id,
+                prompt_text=prompt,
+                schedule_spec=spec,
+                cwd=cwd,
+                submit=False,
+                dry_run=True,
+            )
+            return f"Dry-run {job['id']}: not submitted. Preview skipped in TUI."
         job = create_job(
             agent=agent,
             session_mode=session_mode,
@@ -1159,29 +1246,49 @@ def jobs_menu() -> int:
         return f"Created {job['id']} (not submitted)."
 
     # ---------- schedule picker (generic) ----------
-    # Two-stage constrained flow: pick HH, then pick MM (in 5-min steps).
-    # The (hh, mm) pair is interpreted as an offset from now and converted
-    # to a spec string that resolve_schedule_input accepts. `on_spec(spec)`
-    # is called once the user has finished picking. Callers: new-job,
-    # reschedule, retry.
+    # Three-stage constrained flow: pick mode (interval vs. clock time),
+    # then HH, then MM (in 5-min steps). The (hh, mm) pair is interpreted
+    # per the chosen mode and converted to a spec string that
+    # resolve_schedule_input accepts. `on_spec(spec)` is called once the
+    # user has finished picking. Callers: new-job, reschedule, retry.
     def schedule_picker_start(prompt_prefix: str, on_spec: Callable[[str], str | None]) -> None:
-        hour_items = [(f"{h:02d}", h) for h in range(24)]
+        items = [
+            ("Interval (now + HH:MM)", "interval"),
+            ("At time (next HH:MM)", "clock"),
+        ]
         open_picker(
-            f"{prompt_prefix}: hours from now",
-            hour_items,
-            on_pick=lambda hour: _schedule_pick_minute(prompt_prefix, hour, on_spec),
+            f"{prompt_prefix}: mode",
+            items,
+            on_pick=lambda mode: _schedule_pick_hour(prompt_prefix, mode, on_spec),
         )
+
+    def _schedule_pick_hour(
+        prompt_prefix: str,
+        mode: str,
+        on_spec: Callable[[str], str | None],
+    ) -> str | None:
+        hour_items = [(f"{h:02d}", h) for h in range(24)]
+        label = "hours from now" if mode == "interval" else "hour of day"
+        open_picker(
+            f"{prompt_prefix}: {label}",
+            hour_items,
+            on_pick=lambda hour: _schedule_pick_minute(prompt_prefix, mode, hour, on_spec),
+        )
+        return None
 
     def _schedule_pick_minute(
         prompt_prefix: str,
+        mode: str,
         hour: int,
         on_spec: Callable[[str], str | None],
     ) -> str | None:
         items = [(f"{m:02d}", m) for m in range(0, 60, 5)]
+        label = "minutes from now" if mode == "interval" else "minute of hour"
+        resolver = _resolve_offset_pick if mode == "interval" else _resolve_clock_pick
         open_picker(
-            f"{prompt_prefix}: minutes from now",
+            f"{prompt_prefix}: {label}",
             items,
-            on_pick=lambda minute: on_spec(_resolve_offset_pick(hour, minute)),
+            on_pick=lambda minute: on_spec(resolver(hour, minute)),
         )
         return None
 
@@ -1216,15 +1323,10 @@ def jobs_menu() -> int:
 
     def _nj_pick_session(form: dict) -> None:
         sessions = discover_sessions(form["agent"], cwd=Path(form["cwd"]))
-        items: list[tuple[str, Any]] = [("New session", None)]
-        for session in sessions:
-            title = session.title or "[no title]"
-            label = f"{title} [{session.id[:8]}]"
-            items.append((label, session.id))
-        items.append((PASTE_SESSION_LABEL, PASTE_SESSION_LABEL))
+        items = _session_picker_items(sessions)
 
         def on_pick(value: Any) -> str | None:
-            if value == PASTE_SESSION_LABEL:
+            if value is PASTE_SESSION:
                 open_input(
                     "Paste session ID",
                     "",
@@ -1282,21 +1384,6 @@ def jobs_menu() -> int:
     def _nj_confirmed_submit(form: dict, submit: bool) -> str | None:
         form["submit"] = submit
         return action_create_job(form)
-
-    def start_duplicate_job_flow(job: dict) -> None:
-        """Duplicate selected job: reuse agent/session, pre-fill prompt, pick schedule."""
-        try:
-            existing_prompt = Path(job["prompt_file"]).read_text(encoding="utf-8")
-        except Exception:
-            existing_prompt = ""
-        form: dict = {
-            "agent": job.get("agent"),
-            "session_id": job.get("session_id"),
-            "schedule_spec": "now + 5 minutes",
-            "prompt": existing_prompt,
-            "cwd": job.get("cwd") or str(Path.cwd()),
-        }
-        _nj_pick_schedule(form)
 
     # ---------- rendering ----------
     _COUNT_ORDER = [
@@ -1362,7 +1449,7 @@ def jobs_menu() -> int:
             if state.search_query:
                 msg = f"No jobs match '{state.search_query}'. Press / to edit, Esc to clear.\n"
             else:
-                msg = "No jobs. Press N to create one.\n"
+                msg = "No jobs. Press A to add one.\n"
             fragments.append(("class:muted", msg))
             return fragments
 
@@ -1422,22 +1509,19 @@ def jobs_menu() -> int:
             state.show_help = False
 
     _HELP_HINT_PAIRS: list[tuple[str, str]] = [
-        ("N", "ew"),
-        ("Y", " dup"),
+        ("A", "dd"),
+        ("N", "ow"),
+        ("R", "eschedule"),
         ("E", "dit"),
         ("L", "og"),
         ("P", "refix"),
-        ("T", " time"),
         ("C", " session"),
         ("U", "nschedule"),
         ("S", "ubmit"),
-        ("R", "etry"),
         ("D", "elete"),
         ("f", "ilter"),
         ("F", " scope"),
         ("/", " search"),
-        ("G", " refresh"),
-        ("V", " detail"),
         ("?", " help"),
         ("Q", "uit"),
     ]
@@ -1477,10 +1561,27 @@ def jobs_menu() -> int:
         if not overlay.items:
             fragments.append(("class:muted", " (no choices) \n"))
             return fragments
-        for idx, (label, _value) in enumerate(overlay.items):
-            marker = "> " if idx == overlay.picker_index else "  "
-            style = "class:selected" if idx == overlay.picker_index else ""
+        # picker_window is clamped to max=16 lines; reserve 1 for the title
+        # and 1 for the footer, and scroll around the selected index so
+        # long lists (e.g. 24 hours) remain fully navigable.
+        visible = 14
+        total = len(overlay.items)
+        selected = overlay.picker_index % total
+        if total <= visible:
+            start = 0
+        else:
+            start = max(0, selected - visible // 2)
+            start = min(start, total - visible)
+        end = min(total, start + visible)
+        if start > 0:
+            fragments.append(("class:muted", f"  ... ({start} more above)\n"))
+        for idx in range(start, end):
+            label, _value = overlay.items[idx]
+            marker = "> " if idx == selected else "  "
+            style = "class:selected" if idx == selected else ""
             fragments.append((style, f"{marker}{label}\n"))
+        if end < total:
+            fragments.append(("class:muted", f"  ... ({total - end} more below)\n"))
         fragments.append(
             (
                 "class:muted",
@@ -1671,30 +1772,19 @@ def jobs_menu() -> int:
         label = "project (cwd)" if state.scope == "project" else "all projects"
         state.message = f"Scope: {label}."
 
-    @kb.add("g", filter=no_overlay)
-    def _refresh(event):
-        _maybe_dismiss_help()
-        state.refresh_jobs()
-        state.message = "Refreshed."
-
-    @kb.add("v", filter=no_overlay)
-    def _toggle_detail(event):
-        _maybe_dismiss_help()
-        state.show_detail = not state.show_detail
-        state.message = "Detail shown." if state.show_detail else "Detail hidden."
-
-    @kb.add("enter", filter=no_overlay)
-    def _enter_toggle_detail(event):
-        _maybe_dismiss_help()
-        # In narrow mode, Enter toggles detail; in wider modes it is a
-        # no-op (detail already visible beside the list).
-        if _layout_mode_now() == "narrow":
-            state.show_detail = not state.show_detail
-
-    @kb.add("n", filter=no_overlay)
+    @kb.add("a", filter=no_overlay)
     def _new(event):
         _maybe_dismiss_help()
         start_new_job_flow()
+
+    @kb.add("n", filter=no_overlay)
+    def _run_now(event):
+        _maybe_dismiss_help()
+        job = state.current_job()
+        if not job:
+            state.message = "No job selected."
+            return
+        _dispatch_action(state, lambda: action_reschedule(job, "now + 1 minute"))
 
     @kb.add("e", filter=no_overlay)
     def _edit(event):
@@ -1719,7 +1809,7 @@ def jobs_menu() -> int:
             return
         _dispatch_action(state, lambda: action_view_log(job))
 
-    @kb.add("t", filter=no_overlay)
+    @kb.add("r", filter=no_overlay)
     def _reschedule(event):
         _maybe_dismiss_help()
         job = state.current_job()
@@ -1739,15 +1829,10 @@ def jobs_menu() -> int:
             state.message = "No job selected."
             return
         sessions = discover_sessions(job["agent"], cwd=Path(job["cwd"]))
-        items: list[tuple[str, Any]] = [("New session", None)]
-        for session in sessions:
-            title = session.title or "[no title]"
-            label = f"{title} [{session.id[:8]}]"
-            items.append((label, session.id))
-        items.append((PASTE_SESSION_LABEL, PASTE_SESSION_LABEL))
+        items = _session_picker_items(sessions)
 
         def on_pick(value: Any) -> str | None:
-            if value == PASTE_SESSION_LABEL:
+            if value is PASTE_SESSION:
                 open_input(
                     "Paste session ID",
                     "",
@@ -1781,18 +1866,6 @@ def jobs_menu() -> int:
             state.message = "No job selected."
             return
         _dispatch_action(state, lambda: action_submit(job))
-
-    @kb.add("r", filter=no_overlay)
-    def _retry(event):
-        _maybe_dismiss_help()
-        job = state.current_job()
-        if not job:
-            state.message = "No job selected."
-            return
-        schedule_picker_start(
-            f"Retry {job['id']}",
-            on_spec=lambda spec: action_retry(job, spec),
-        )
 
     @kb.add("d", filter=no_overlay)
     def _delete(event):
@@ -1867,15 +1940,6 @@ def jobs_menu() -> int:
             state.refresh_jobs()
             state.message = "Search cleared."
 
-    @kb.add("y", filter=no_overlay)
-    def _duplicate(event):
-        _maybe_dismiss_help()
-        job = state.current_job()
-        if not job:
-            state.message = "No job selected."
-            return
-        start_duplicate_job_flow(job)
-
     @kb.add("c-c")
     def _ctrl_c(event):
         state.quit = True
@@ -1906,7 +1970,7 @@ def jobs_menu() -> int:
     picker_window = Window(
         content=FormattedTextControl(picker_fragments),
         wrap_lines=False,
-        height=Dimension(min=3, max=16),
+        height=Dimension(min=3, max=18),
     )
 
     body = HSplit(
@@ -1997,6 +2061,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         prog=APP_NAME,
         description="Schedule Codex and Claude CLI jobs.",
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"{APP_NAME} {APP_VERSION}",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview the scheduled at(1) script without submitting.",
+    )
     sub = parser.add_subparsers(dest="command")
 
     list_p = sub.add_parser("list", help="List jobs.")
@@ -2039,10 +2113,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     retry_p = sub.add_parser("retry", help="Retry a completed/failed job at a new time.")
     retry_p.add_argument("job_id")
-    retry_p.add_argument("when")
+    retry_p.add_argument(
+        "when",
+        nargs="?",
+        default="now + 1 minute",
+        help="Schedule spec (default: 'now + 1 minute').",
+    )
 
     sub_p = sub.add_parser("submit", help="Submit or repair a queued/scheduled job.")
     sub_p.add_argument("job_id")
+
+    edit_prefix_p = sub.add_parser(
+        "edit-prefix",
+        help="Edit the prompt prefix for an agent in $EDITOR.",
+    )
+    edit_prefix_p.add_argument("agent", choices=["claude", "codex"])
 
     mark_p = sub.add_parser("mark", help="Update job execution state (for scheduled wrapper use).")
     mark_sub = mark_p.add_subparsers(dest="mark_state")
@@ -2096,8 +2181,6 @@ def cli_doctor(
     verbose: bool = False,
     quiet: bool = False,
 ) -> int:
-    from . import preflight
-
     report = preflight.run_checks(include_roundtrip=roundtrip)
 
     if as_json:
@@ -2175,7 +2258,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "retry":
             return cli_retry_job(args.job_id, args.when)
         if args.command == "submit":
-            return cli_submit_job(args.job_id)
+            return cli_submit_job(args.job_id, dry_run=args.dry_run)
+        if args.command == "edit-prefix":
+            return cli_edit_prefix(args.agent)
         if args.command == "doctor":
             return cli_doctor(
                 roundtrip=args.roundtrip,
@@ -2206,7 +2291,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             parser.error("mark requires a state: running, done, or failed")
 
-        return jobs_menu()
+        return jobs_menu(dry_run=args.dry_run)
     except KeyboardInterrupt:
         print("\nCancelled.")
         return 130

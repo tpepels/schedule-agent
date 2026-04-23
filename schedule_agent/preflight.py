@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from .config import prompt_prefix_path
 from .environment import (
     KNOWN_GOOD_AGENT_VERSIONS,
     AgentProbe,
@@ -179,12 +180,12 @@ def check_agent(agent: str, probe: AgentProbe | None = None) -> CheckResult:
             detail=detail,
         )
     if probe.version_known_good is False:
-        known = sorted(KNOWN_GOOD_AGENT_VERSIONS[agent])
+        minimum = sorted(KNOWN_GOOD_AGENT_VERSIONS[agent])[0]
         return CheckResult(
             name=name,
             label=label,
             severity="WARN",
-            message=f"{probe.version} is untested; last known-good: {known}",
+            message=f"{probe.version} is older than known-good minimum {minimum}",
             detail=detail,
         )
     return CheckResult(
@@ -330,6 +331,42 @@ def check_at_roundtrip() -> CheckResult:
                 pass
 
 
+def check_prompt_prefix(agent: str) -> CheckResult:
+    """Warn if the prompt prefix for `agent` is missing or unreadable.
+
+    The prefix is auto-created on first use via `ensure_prompt_prefix`; a
+    stale state where the config dir exists but the prefix file has been
+    deleted silently strips "you are running autonomously" framing from
+    every scheduled job, degrading output quality without a signal.
+    """
+    name = f"prompt_prefix_{agent}"
+    label = f"{agent} prompt prefix"
+    path = prompt_prefix_path(agent)
+    if not path.exists():
+        return CheckResult(
+            name=name,
+            label=label,
+            severity="WARN",
+            message=f"missing: {path} (will be auto-created on first submit)",
+            detail={"path": str(path)},
+        )
+    if not os.access(path, os.R_OK):
+        return CheckResult(
+            name=name,
+            label=label,
+            severity="FAIL",
+            message=f"not readable: {path}",
+            detail={"path": str(path)},
+        )
+    return CheckResult(
+        name=name,
+        label=label,
+        severity="PASS",
+        message=str(path),
+        detail={"path": str(path)},
+    )
+
+
 def run_checks(include_roundtrip: bool = False) -> PreflightReport:
     """Run every preflight check and return a PreflightReport."""
     results: list[CheckResult] = []
@@ -344,6 +381,9 @@ def run_checks(include_roundtrip: bool = False) -> PreflightReport:
 
     results.append(check_session_dir("claude", claude_result.severity))
     results.append(check_session_dir("codex", codex_result.severity))
+
+    results.append(check_prompt_prefix("claude"))
+    results.append(check_prompt_prefix("codex"))
 
     if include_roundtrip:
         results.append(check_at_roundtrip())

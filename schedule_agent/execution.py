@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import shlex
 
-from .config import prompt_prefix_path
 from .legacy.compat import resolve_session_id
 
 
@@ -26,15 +25,19 @@ AGENTS: dict[str, dict] = {
 }
 
 
-def _prompt_expr(agent: str, prompt_file: str) -> str:
-    """Shell expression that cats the prefix (if present) + prompt file.
+def _prompt_expr(prefix_snapshot: str | None, prompt_file: str) -> str:
+    """Shell expression that cats the frozen prefix snapshot + prompt file.
 
-    Using `2>/dev/null` on the prefix keeps the command silent if the user
-    deletes it between edits. An intermediate `echo` guarantees a newline
-    separator even if the prefix file lacks a trailing newline.
+    The prefix is snapshotted into the job's log_dir at submit time so a
+    later edit of the live prefix (or tampering with it between schedule
+    and fire) cannot change what the scheduled job actually sends to the
+    agent. `2>/dev/null` keeps the command silent if the snapshot was
+    never written (e.g. job scheduled before snapshot plumbing existed).
     """
-    prefix = shlex.quote(str(prompt_prefix_path(agent)))
     prompt = shlex.quote(prompt_file)
+    if prefix_snapshot is None:
+        return f'"$(cat {prompt})"'
+    prefix = shlex.quote(prefix_snapshot)
     return f'"$(cat {prefix} 2>/dev/null; echo; cat {prompt})"'
 
 
@@ -42,10 +45,12 @@ def build_agent_cmd(job: dict) -> str:
     """Build the shell command to invoke the agent for this job.
 
     Deprecated compatibility with the old `session` field is isolated under
-    `schedule_agent.legacy`.
+    `schedule_agent.legacy`. The prefix snapshot is resolved from
+    job["prefix_snapshot_file"] if present (written at submit time), else
+    omitted — legacy jobs submitted before snapshotting just get the prompt.
     """
     cfg = AGENTS[job["agent"]]
-    prompt_expr = _prompt_expr(job["agent"], job["prompt_file"])
+    prompt_expr = _prompt_expr(job.get("prefix_snapshot_file"), job["prompt_file"])
     base = " ".join(cfg["base_args"])
     bin_ = shlex.quote(_agent_bin(job, cfg))
 

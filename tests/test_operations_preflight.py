@@ -80,7 +80,7 @@ def test_create_job_populates_provenance_fields(app_modules, monkeypatch):
     ops = app_modules.operations
     monkeypatch.setenv("PATH", "/home/u/.local/bin:/usr/bin")
     monkeypatch.setattr(
-        environment, "capture_path", lambda raw=None: ["/home/u/.local/bin", "/usr/bin"]
+        ops.environment, "capture_path", lambda raw=None: ["/home/u/.local/bin", "/usr/bin"]
     )
     monkeypatch.setattr(ops, "_submit_preflight", lambda agent: (_report(_pass()), _probe()))
     job = _create(app_modules, monkeypatch)

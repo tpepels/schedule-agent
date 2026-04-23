@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import fcntl
 import os
+import shlex
 import shutil
+import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,7 +41,13 @@ from .state_model import (
     display_label,
     scheduler_label,
 )
-from .time_utils import iso_to_display, now_iso, sort_key_for_iso, title_from_prompt
+from .time_utils import (
+    iso_to_display,
+    now_iso,
+    parse_iso_datetime,
+    sort_key_for_iso,
+    title_from_prompt,
+)
 from .transitions import (
     make_job,
     on_change_session,
@@ -80,6 +88,62 @@ def _locked_queue():
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _stale_threshold_seconds() -> int:
+    raw = os.environ.get("SCHEDULE_AGENT_STALE_MINUTES", "60")
+    try:
+        minutes = int(raw)
+    except ValueError:
+        minutes = 60
+    return max(1, minutes) * 60
+
+
+def _is_stale_running(job: dict, now_ts: float, threshold: int) -> bool:
+    # A job is "stuck" running when its driver script died before the EXIT
+    # trap (mark done/failed) could fire — typically a reboot or kill.
+    # Detect this by combining two signals: the recorded start is older
+    # than the threshold AND the log file hasn't been written to recently
+    # (or is missing). Both conditions must hold so that genuinely
+    # long-running but quiet jobs aren't killed off.
+    if job.get("submission") != "running":
+        return False
+    started = job.get("last_started_at")
+    if not started:
+        return False
+    try:
+        started_ts = parse_iso_datetime(started).timestamp()
+    except ValueError:
+        return False
+    if now_ts - started_ts < threshold:
+        return False
+    log_file = job.get("last_log_file")
+    if log_file:
+        try:
+            log_mtime = os.path.getmtime(log_file)
+        except OSError:
+            return True
+        return now_ts - log_mtime >= threshold
+    return True
+
+
+def _recover_stale_running_inplace(jobs: list[dict]) -> bool:
+    threshold = _stale_threshold_seconds()
+    now_ts = parse_iso_datetime(now_iso()).timestamp()
+    changed = False
+    for idx, job in enumerate(jobs):
+        if job.get("_invalid"):
+            continue
+        if not _is_stale_running(job, now_ts, threshold):
+            continue
+        jobs[idx] = on_failure(
+            job,
+            finished_at=now_iso(),
+            exit_code=-1,
+            log_file=job.get("last_log_file"),
+        )
+        changed = True
+    return changed
 
 
 def _job_id(agent: str) -> str:
@@ -163,7 +227,10 @@ def _sort_jobs(jobs: list[dict]) -> list[dict]:
 
 
 def list_job_views(filter_name: str = "all") -> tuple[list[dict], str | None]:
-    jobs = load_jobs()
+    with _locked_queue():
+        jobs = load_jobs()
+        if _recover_stale_running_inplace(jobs):
+            save_jobs(jobs)
     atq_entries, atq_error = query_atq()
     views = [_job_with_scheduler(job, atq_entries, atq_error) for job in jobs]
 
@@ -190,6 +257,8 @@ def get_job_view(job_id: str) -> dict | None:
 
 def _load_locked_job(job_id: str) -> tuple[list[dict], int, dict]:
     jobs = load_jobs()
+    if _recover_stale_running_inplace(jobs):
+        save_jobs(jobs)
     idx, job = find_job(jobs, job_id)
     if idx is None or job is None:
         raise OperationError(f"No such job: {job_id}")
@@ -303,7 +372,12 @@ def create_job(
     schedule_spec: str,
     cwd: str,
     submit: bool = True,
+    dry_run: bool = False,
 ) -> dict:
+    # dry_run=True: resolve the schedule, build the at(1) script, but do not
+    # persist a job record and do not enqueue with at. The preview text is
+    # attached to the returned job dict under "_dry_run_preview" so callers
+    # can display it.
     with _locked_queue():
         report, probe = _submit_preflight(agent)
         if not report.critical_ok():
@@ -312,6 +386,25 @@ def create_job(
 
         job_id = _job_id(agent)
         scheduled_for = resolve_schedule_spec(schedule_spec)
+        if dry_run:
+            # Don't write the prompt file either — dry-run is pure preview.
+            preview_prompt_file = str(_prompt_dir() / f"{job_id}.md")
+            job = make_job(
+                job_id=job_id,
+                title=title_from_prompt(prompt_text),
+                agent=agent,
+                session_mode=session_mode,
+                session_id=session_id,
+                prompt_file=preview_prompt_file,
+                scheduled_for=scheduled_for,
+                cwd=cwd,
+                log_dir=job_log_dir(job_id),
+            )
+            job["provenance"] = _build_provenance(probe, report)
+            _, preview = submit_job(job, dry_run=True)
+            job["_dry_run_preview"] = preview
+            return job
+
         prompt_file = write_prompt_file(_prompt_dir(), job_id, prompt_text)
         job = make_job(
             job_id=job_id,
@@ -398,7 +491,7 @@ def delete_job(job_id: str) -> None:
     )
 
 
-def submit_or_repair_job(job_id: str) -> dict:
+def submit_or_repair_job(job_id: str, dry_run: bool = False) -> dict:
     with _locked_queue():
         jobs, idx, job = _load_locked_job(job_id)
         if job["submission"] == "running":
@@ -412,6 +505,11 @@ def submit_or_repair_job(job_id: str) -> dict:
                 f"execution={working['execution']}, "
                 f"readiness={working['readiness']})"
             )
+        if dry_run:
+            _, preview = submit_job(working, dry_run=True)
+            working = dict(working)
+            working["_dry_run_preview"] = preview
+            return working
         submitted, _ = _resubmit(working)
         jobs[idx] = submitted
         save_jobs(jobs)
@@ -455,6 +553,40 @@ def _update_dependents(jobs: list[dict], parent_id: str, parent_result: str) -> 
     return updated_jobs
 
 
+def _fire_post_hook(job: dict, result: str) -> None:
+    # Opt-in post-completion hook: SCHEDULE_AGENT_POST_HOOK is a shell
+    # command fragment that receives JOB_ID / JOB_TITLE / JOB_RESULT /
+    # JOB_EXIT_CODE / JOB_LOG_FILE in its environment. Any failure is
+    # swallowed — the hook must never block state advancement, because
+    # mark_finished runs in the at(1) wrapper's EXIT trap.
+    hook = os.environ.get("SCHEDULE_AGENT_POST_HOOK")
+    if not hook:
+        return
+    try:
+        parts = shlex.split(hook)
+    except ValueError:
+        return
+    if not parts:
+        return
+    env = dict(os.environ)
+    env["JOB_ID"] = job.get("id", "")
+    env["JOB_TITLE"] = job.get("title") or ""
+    env["JOB_RESULT"] = result
+    env["JOB_EXIT_CODE"] = str(job.get("last_exit_code") or "")
+    env["JOB_LOG_FILE"] = job.get("last_log_file") or ""
+    try:
+        subprocess.Popen(
+            parts,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except OSError:
+        pass
+
+
 def mark_finished(
     job_id: str,
     finished_at: str,
@@ -482,7 +614,8 @@ def mark_finished(
         jobs[idx] = updated
         jobs = _update_dependents(jobs, parent_id=job_id, parent_result=result)
         save_jobs(jobs)
-        return updated
+    _fire_post_hook(updated, result)
+    return updated
 
 
 def format_job_summary(job: dict) -> str:
