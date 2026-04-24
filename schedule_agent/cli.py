@@ -931,11 +931,21 @@ _PRINTABLE_CHARS = set(
 
 
 def _input_char_accept(ch: str) -> bool:
+    # Accept single characters (keystrokes) AND multi-char runs (paste).
+    # Session ids contain uuid-shaped strings; a keyboard paste arrives as
+    # a single event.data blob when bracketed paste is active, and as a
+    # burst of single-char events otherwise — both paths must land in the
+    # input buffer.
     if not ch:
         return False
-    if len(ch) != 1:
-        return False
-    return ch in _PRINTABLE_CHARS
+    return all(c in _PRINTABLE_CHARS for c in ch)
+
+
+def _sanitize_paste(text: str) -> str:
+    # Strip non-printable control bytes (newlines, tabs, ESC sequences)
+    # while preserving every accepted printable character. Used for both
+    # bracketed-paste events and oversize <any> bursts.
+    return "".join(c for c in text if c in _PRINTABLE_CHARS)
 
 
 # --- dispatch_action ------------------------------------------------------
@@ -1695,11 +1705,27 @@ def jobs_menu(dry_run: bool = False) -> int:
     def _input_clear(event):
         state.overlay.buffer = ""
 
+    # Bracketed paste (Ctrl+Shift+V, Cmd+V, terminal paste keystroke) arrives
+    # as a single Keys.BracketedPaste event with the full pasted string in
+    # event.data. Without this handler the <any> handler below sees it but
+    # rejects multi-char runs (and earlier it required len == 1).
+    from prompt_toolkit.keys import Keys
+
+    @kb.add(Keys.BracketedPaste, filter=input_overlay)
+    def _input_paste(event):
+        pasted = _sanitize_paste(event.data or "")
+        if pasted:
+            state.overlay.buffer += pasted
+
     @kb.add("<any>", filter=input_overlay)
     def _input_any(event):
-        ch = event.data or ""
-        if _input_char_accept(ch):
-            state.overlay.buffer += ch
+        data = event.data or ""
+        # Filter non-printable control bytes but preserve the rest of the
+        # burst — terminals that do not emit bracketed paste deliver paste
+        # as one multi-char data blob here.
+        clean = _sanitize_paste(data)
+        if clean:
+            state.overlay.buffer += clean
 
     # ----- overlay: picker -----
     @kb.add("up", filter=picker_overlay)

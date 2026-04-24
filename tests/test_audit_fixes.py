@@ -343,6 +343,24 @@ def test_post_hook_fires_with_job_env(app_modules, monkeypatch):
     assert env["JOB_LOG_FILE"] == "/tmp/x.log"
 
 
+def test_input_char_accept_allows_paste_burst(app_modules):
+    cli = app_modules.cli
+    # Multi-char printable burst (a paste of a UUID-shaped session id).
+    assert cli._input_char_accept("a1b2c3d4-5678-90ab-cdef-1234567890ab")
+    # Single char works.
+    assert cli._input_char_accept("x")
+    # Empty is rejected.
+    assert not cli._input_char_accept("")
+    # Any control byte in the run causes rejection.
+    assert not cli._input_char_accept("abc\n")
+
+
+def test_sanitize_paste_strips_control_bytes(app_modules):
+    cli = app_modules.cli
+    pasted = "session-id-abc\n\t\x1bdef"
+    assert cli._sanitize_paste(pasted) == "session-id-abcdef"
+
+
 def test_post_hook_is_noop_when_env_unset(app_modules, monkeypatch):
     operations = app_modules.operations
     monkeypatch.delenv("SCHEDULE_AGENT_POST_HOOK", raising=False)
