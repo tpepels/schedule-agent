@@ -327,6 +327,7 @@ def test_run_checks_order_and_no_roundtrip(monkeypatch):
         return _cr(f"session_dir_{agent}")
 
     monkeypatch.setattr(preflight, "check_session_dir", fake_session)
+    monkeypatch.setattr(preflight, "check_prompt_prefix", lambda a: _cr(f"prompt_prefix_{a}"))
     monkeypatch.setattr(preflight, "check_at_roundtrip", lambda: _cr("at_roundtrip"))
 
     report = preflight.run_checks()
@@ -339,6 +340,8 @@ def test_run_checks_order_and_no_roundtrip(monkeypatch):
         "agent_codex",
         "session_dir_claude",
         "session_dir_codex",
+        "prompt_prefix_claude",
+        "prompt_prefix_codex",
     ]
     # claude agent PASS → session dir called with PASS; codex FAIL → called with FAIL
     assert session_calls == [("claude", "PASS"), ("codex", "FAIL")]
@@ -350,11 +353,12 @@ def test_run_checks_include_roundtrip(monkeypatch):
     monkeypatch.setattr(preflight, "check_xdg_dirs", lambda: _cr("xdg_dirs"))
     monkeypatch.setattr(preflight, "check_agent", lambda a: _cr(f"agent_{a}"))
     monkeypatch.setattr(preflight, "check_session_dir", lambda a, s: _cr(f"session_dir_{a}"))
+    monkeypatch.setattr(preflight, "check_prompt_prefix", lambda a: _cr(f"prompt_prefix_{a}"))
     monkeypatch.setattr(preflight, "check_at_roundtrip", lambda: _cr("at_roundtrip"))
 
     report = preflight.run_checks(include_roundtrip=True)
     assert report.results[-1].name == "at_roundtrip"
-    assert len(report.results) == 8
+    assert len(report.results) == 10
 
 
 def test_preflight_report_methods():

@@ -178,6 +178,24 @@ def test_probe_agent_unknown_version_warn(monkeypatch):
 
     def fake_run(cmd, **kwargs):
         if "--version" in cmd:
+            # Below the 2.1.112 minimum → flagged as not known-good.
+            return _Proc(stdout="1.0.0 (ancient)", returncode=0)
+        return _Proc(
+            stdout="--resume --dangerously-skip-permissions",
+            returncode=0,
+        )
+
+    monkeypatch.setattr(environment.subprocess, "run", fake_run)
+    probe = probe_agent("claude")
+    assert probe.version == "1.0.0"
+    assert probe.version_known_good is False
+
+
+def test_probe_agent_future_version_ok(monkeypatch):
+    monkeypatch.setattr(environment.shutil, "which", lambda _: "/fake/claude")
+
+    def fake_run(cmd, **kwargs):
+        if "--version" in cmd:
             return _Proc(stdout="9.9.9 (future)", returncode=0)
         return _Proc(
             stdout="--resume --dangerously-skip-permissions",
@@ -187,7 +205,7 @@ def test_probe_agent_unknown_version_warn(monkeypatch):
     monkeypatch.setattr(environment.subprocess, "run", fake_run)
     probe = probe_agent("claude")
     assert probe.version == "9.9.9"
-    assert probe.version_known_good is False
+    assert probe.version_known_good is True
 
 
 def test_probe_agent_help_missing_substring(monkeypatch):

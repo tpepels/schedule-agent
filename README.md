@@ -136,7 +136,12 @@ schedule-agent session <id> <session_id>     # attach a session
 schedule-agent session <id> --new            # reset to a fresh session
 
 schedule-agent delete <id>
-schedule-agent --dry-run                     # preview without submitting
+
+schedule-agent --dry-run                     # TUI: creating a job shows preview, skips submission
+schedule-agent --dry-run submit <id>         # preview the at(1) script for an existing job
+
+schedule-agent edit-prefix {claude|codex}    # edit the per-agent prompt prefix in $EDITOR
+schedule-agent --version
 ```
 
 ### Safe mutations
@@ -171,10 +176,22 @@ export EDITOR="code --wait"
 
 | Path | Contents |
 |------|----------|
-| `~/.local/state/schedule-agent/` | job queue + state |
+| `~/.local/state/schedule-agent/` | job queue + state + logs |
 | `~/.local/share/schedule-agent/agent_prompts/` | prompt files |
+| `~/.config/schedule-agent/prompt-prefix-{claude,codex}.md` | per-agent prefix applied to every scheduled prompt |
 
-`$XDG_STATE_HOME` and `$XDG_DATA_HOME` are honoured if set.
+`$XDG_STATE_HOME`, `$XDG_DATA_HOME`, and `$XDG_CONFIG_HOME` are honoured if set.
+
+State, logs, and prompt dirs are chmod-ed to `0700` on creation — logs may contain secrets produced by the agent.
+
+### Environment variables
+
+| Variable | Effect |
+|----------|--------|
+| `SCHEDULE_AGENT_EDITOR` | Editor for prompt/prefix editing (wins over `$EDITOR`) |
+| `SCHEDULE_AGENT_STALE_MINUTES` | Minutes a `running` job must be idle (no log writes) before the recovery path force-marks it failed. Default `60`, minimum `1`. |
+| `SCHEDULE_AGENT_POST_HOOK` | Optional shell command fired after every job finishes. Receives `JOB_ID`, `JOB_TITLE`, `JOB_RESULT` (`success`/`failed`), `JOB_EXIT_CODE`, `JOB_LOG_FILE` in its environment. Failures are swallowed. |
+| `SCHEDULE_AGENT_MIN_CLAUDE` / `SCHEDULE_AGENT_MIN_CODEX` | Override the preflight minimum known-good version per agent. |
 
 ---
 

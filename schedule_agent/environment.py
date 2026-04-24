@@ -8,10 +8,41 @@ from dataclasses import dataclass
 
 from .execution import AGENTS
 
-KNOWN_GOOD_AGENT_VERSIONS: dict[str, set[str]] = {
-    "claude": {"2.1.112"},
-    "codex": {"0.120.0"},
+# Minimum known-good version per agent. Any version >= this is treated as
+# compatible; preflight only warns when the probed version is strictly
+# older. Override per-agent via env:
+#   SCHEDULE_AGENT_MIN_CLAUDE=2.1.112
+#   SCHEDULE_AGENT_MIN_CODEX=0.120.0
+KNOWN_GOOD_MIN_VERSIONS: dict[str, str] = {
+    "claude": "2.1.112",
+    "codex": "0.120.0",
 }
+
+# Retained for backwards-compat with tests / external callers; now derived.
+KNOWN_GOOD_AGENT_VERSIONS: dict[str, set[str]] = {
+    agent: {minimum} for agent, minimum in KNOWN_GOOD_MIN_VERSIONS.items()
+}
+
+
+def _parse_version(value: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for segment in value.split("."):
+        digits = "".join(ch for ch in segment if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def _min_version_for(agent: str) -> str:
+    env_key = f"SCHEDULE_AGENT_MIN_{agent.upper()}"
+    return os.environ.get(env_key) or KNOWN_GOOD_MIN_VERSIONS[agent]
+
+
+def _version_at_least(probed: str, minimum: str) -> bool:
+    try:
+        return _parse_version(probed) >= _parse_version(minimum)
+    except Exception:
+        return False
+
 
 REQUIRED_AGENT_HELP_SUBSTRINGS: dict[str, list[str]] = {
     "claude": ["--resume", "--dangerously-skip-permissions"],
@@ -90,7 +121,7 @@ def probe_agent(agent: str) -> AgentProbe:
         error = str(exc)
         version = None
 
-    version_known_good = version is not None and version in KNOWN_GOOD_AGENT_VERSIONS[agent]
+    version_known_good = version is not None and _version_at_least(version, _min_version_for(agent))
 
     help_ok = False
     try:

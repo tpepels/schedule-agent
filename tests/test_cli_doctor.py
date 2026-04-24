@@ -18,7 +18,7 @@ def _result(name: str, severity: str, message: str = "", detail: dict | None = N
 def _install_report(monkeypatch, app_modules, results):
     report = preflight.PreflightReport(results=results)
     monkeypatch.setattr(
-        app_modules.cli.preflight if hasattr(app_modules.cli, "preflight") else preflight,
+        app_modules.cli.preflight,
         "run_checks",
         lambda include_roundtrip=False: report,
     )

@@ -110,10 +110,23 @@ def test_agents_config_has_required_keys():
         assert "base_args" in cfg
 
 
-def test_prompt_prefix_is_prepended(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+def test_prompt_prefix_snapshot_is_prepended(tmp_path):
+    # Prefix is now a per-job immutable snapshot written at submit time by
+    # scheduler_backend; build_agent_cmd simply reads the path from
+    # job["prefix_snapshot_file"] and cats it before the prompt.
+    snapshot = tmp_path / "prefix.snapshot"
+    snapshot.write_text("PREFIX TEXT\n", encoding="utf-8")
+    cmd = build_agent_cmd(
+        _job("claude", prompt_file="/tmp/p.md", prefix_snapshot_file=str(snapshot))
+    )
+    assert str(snapshot) in cmd
+    assert cmd.index(str(snapshot)) < cmd.index("/tmp/p.md")
+
+
+def test_prompt_prefix_absent_when_no_snapshot():
+    # Legacy job records (pre-snapshot era) lack the field; build_agent_cmd
+    # omits the prefix fragment entirely rather than referencing a file
+    # that will never exist.
     cmd = build_agent_cmd(_job("claude", prompt_file="/tmp/p.md"))
-    # prefix file path for claude should appear before the prompt cat
-    prefix_token = "prompt-prefix-claude.md"
-    assert prefix_token in cmd
-    assert cmd.index(prefix_token) < cmd.index("/tmp/p.md")
+    assert "prefix.snapshot" not in cmd
+    assert "cat /tmp/p.md" in cmd
