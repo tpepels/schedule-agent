@@ -25,6 +25,12 @@ Then one of these happens:
 
 ---
 
+## Screenshot
+
+![schedule-agent jobs overview](docs/assets/task-scheduler-screenshot.png)
+
+---
+
 ## Quick start
 
 ```bash
