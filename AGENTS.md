@@ -14,3 +14,4 @@ hope of sorting it out later. The GitHub Actions workflow runs the exact same
 
 This rule has no exceptions for "small" or "doc-only" changes — the CI job is
 cheap to run locally and avoids red main.
+
