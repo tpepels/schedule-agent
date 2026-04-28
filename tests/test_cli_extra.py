@@ -1,3 +1,4 @@
+import importlib
 import json
 import os
 from pathlib import Path
@@ -29,8 +30,9 @@ def _job(app_modules, **overrides):
     return job
 
 
-def test_extract_session_title_reads_supported_claude_and_codex_formats(app_modules, tmp_path):
-    cli = app_modules.cli
+def test_extract_session_title_reads_supported_claude_and_codex_formats(tmp_path):
+    from schedule_agent.sessions.providers.common import extract_session_title
+
     claude_ai = tmp_path / "claude-ai.jsonl"
     claude_user = tmp_path / "claude-user.jsonl"
     codex_event = tmp_path / "codex-event.jsonl"
@@ -62,14 +64,16 @@ def test_extract_session_title_reads_supported_claude_and_codex_formats(app_modu
         },
     )
 
-    assert cli.extract_session_title(str(claude_ai), "claude") == "Claude title"
-    assert cli.extract_session_title(str(claude_user), "claude") == "First line"
-    assert cli.extract_session_title(str(codex_event), "codex") == "Codex event"
-    assert cli.extract_session_title(str(codex_response), "codex") == "Codex response"
-    assert cli.extract_session_title(str(tmp_path / "missing.jsonl"), "codex") is None
+    assert extract_session_title(claude_ai, "claude") == "Claude title"
+    assert extract_session_title(claude_user, "claude") == "First line"
+    assert extract_session_title(codex_event, "codex") == "Codex event"
+    assert extract_session_title(codex_response, "codex") == "Codex response"
+    assert extract_session_title(tmp_path / "missing.jsonl", "codex") is None
 
 
-def test_choose_session_prefers_current_claude_project(app_modules, monkeypatch, tmp_path):
+def test_choose_session_prefers_current_claude_project_and_hides_unrelated_by_default(
+    app_modules, monkeypatch, tmp_path
+):
     cli = app_modules.cli
     monkeypatch.setenv("HOME", str(tmp_path))
     cwd = Path("/work/current/project")
@@ -109,15 +113,48 @@ def test_choose_session_prefers_current_claude_project(app_modules, monkeypatch,
     assert captured["message"] == "Session"
     assert captured["choices"][0] == "New session"
     assert "Preferred session" in captured["choices"][1]
-    assert "Other session" in captured["choices"][2]
+    assert captured["choices"][2] == cli.PASTE_SESSION_LABEL
     assert selected == "preferred"
 
 
-def test_discover_codex_sessions_skips_subagent_rollouts(app_modules, monkeypatch, tmp_path):
-    cli = app_modules.cli
+def test_public_session_discovery_api_prefers_current_claude_project(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
-    root = tmp_path / ".codex" / "sessions"
 
+    import schedule_agent.sessions.discovery as discovery
+
+    discovery = importlib.reload(discovery)
+    cwd = Path("/work/current/project")
+    preferred_dir = tmp_path / ".claude" / "projects" / cwd.as_posix().replace("/", "-")
+    other_dir = tmp_path / ".claude" / "projects" / "other-project"
+
+    preferred = preferred_dir / "preferred.jsonl"
+    other = other_dir / "other.jsonl"
+
+    _write_jsonl(
+        preferred,
+        {"type": "user", "message": {"role": "user", "content": "Preferred session"}},
+    )
+    _write_jsonl(
+        other,
+        {"type": "user", "message": {"role": "user", "content": "Other session"}},
+    )
+
+    sessions = discovery.discover_sessions("claude", cwd=cwd, limit=10, all_projects=True)
+
+    assert sessions[0].title == "Preferred session"
+    assert any(session.title == "Other session" for session in sessions)
+
+
+def test_public_session_discovery_api_hides_codex_subagent_rollouts(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    import schedule_agent.sessions.discovery as discovery
+
+    discovery = importlib.reload(discovery)
+    root = tmp_path / ".codex" / "sessions"
     top = root / "2026" / "04" / "18" / "rollout-top.jsonl"
     sub = root / "2026" / "04" / "18" / "rollout-sub.jsonl"
 
@@ -138,10 +175,11 @@ def test_discover_codex_sessions_skips_subagent_rollouts(app_modules, monkeypatc
         {"type": "event_msg", "payload": {"type": "user_message", "message": "Sub"}},
     )
 
-    sessions = cli._discover_codex_sessions(limit=10)
-    ids = [s.id for s in sessions]
-    assert "rollout-top" in ids
-    assert "rollout-sub" not in ids
+    sessions = discovery.discover_sessions("codex", cwd=tmp_path, limit=10, all_projects=True)
+    ids = [session.session_id for session in sessions]
+
+    assert "top" in ids
+    assert "sub" not in ids
 
 
 def test_read_prompt_uses_editor_output_and_cleans_up_tempfile(app_modules, monkeypatch):

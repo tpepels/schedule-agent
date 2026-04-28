@@ -45,6 +45,10 @@ from .persistence import (
     write_prompt_file as _write_prompt_file,
 )
 from .scheduler_backend import submit_job
+from .sessions import SessionCandidate
+from .sessions import diagnose_sessions as diagnose_session_candidates
+from .sessions import discover_all_sessions as discover_all_session_candidates
+from .sessions import discover_sessions as discover_session_candidates
 from .time_utils import iso_to_display, parse_iso_datetime
 from .transitions import on_cancel
 
@@ -178,178 +182,6 @@ def edit_file(path: Path) -> None:
     subprocess.run([*_resolve_editor(), str(path)], check=False)
 
 
-@dataclass
-class SessionInfo:
-    id: str
-    path: Path
-    agent: str
-    project: str | None
-    title: str | None
-    modified_at: float
-
-
-def extract_session_title(path: str, agent: str) -> str | None:
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            lines = handle.readlines()
-    except Exception:
-        return None
-
-    def iter_json():
-        for line in lines:
-            try:
-                yield json.loads(line)
-            except Exception:
-                continue
-
-    agent = agent.lower().strip()
-
-    if agent == "claude":
-        for obj in iter_json():
-            if obj.get("type") == "ai-title":
-                title = obj.get("aiTitle")
-                if isinstance(title, str) and title.strip():
-                    return title.strip()
-        for obj in iter_json():
-            if obj.get("type") != "user" or obj.get("isMeta"):
-                continue
-            message = obj.get("message", {})
-            if message.get("role") != "user":
-                continue
-            content = message.get("content")
-            if isinstance(content, str) and content.strip():
-                return content.strip().splitlines()[0]
-        return None
-
-    if agent == "codex":
-        for obj in iter_json():
-            if obj.get("type") == "event_msg":
-                payload = obj.get("payload", {})
-                if payload.get("type") == "user_message":
-                    message = payload.get("message")
-                    if isinstance(message, str) and message.strip():
-                        return message.strip().splitlines()[0]
-        for obj in iter_json():
-            if obj.get("type") == "response_item":
-                payload = obj.get("payload", {})
-                if payload.get("type") == "message" and payload.get("role") == "user":
-                    for item in payload.get("content", []):
-                        if item.get("type") == "input_text":
-                            text = item.get("text")
-                            if isinstance(text, str) and text.strip():
-                                return text.strip().splitlines()[0]
-        return None
-
-    return None
-
-
-def _codex_session_is_subagent(path: Path) -> bool:
-    """True when the first `session_meta` row marks this file as a subagent.
-
-    Codex writes `payload.source = {"subagent": {...}}` for sessions spawned
-    via its subagent mechanism; top-level sessions use a string ('exec',
-    'cli', 'vscode'). These subagent rollouts cannot be resumed meaningfully,
-    so they are hidden from the picker.
-    """
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            first = handle.readline()
-    except OSError:
-        return False
-    try:
-        record = json.loads(first)
-    except (ValueError, TypeError):
-        return False
-    payload = record.get("payload") or {}
-    source = payload.get("source")
-    return isinstance(source, dict) and "subagent" in source
-
-
-def _safe_mtime(path: Path) -> float:
-    try:
-        return path.stat().st_mtime
-    except OSError:
-        return 0.0
-
-
-def _discover_codex_sessions(limit: int) -> list[SessionInfo]:
-    root = Path.home() / ".codex" / "sessions"
-    if not root.exists():
-        return []
-    try:
-        files = [path for path in root.rglob("*.jsonl") if path.is_file()]
-    except OSError:
-        return []
-    files = [p for p in files if not _codex_session_is_subagent(p)]
-    files.sort(key=_safe_mtime, reverse=True)
-    return [
-        SessionInfo(
-            id=path.stem,
-            path=path,
-            agent="codex",
-            project=None,
-            title=extract_session_title(str(path), "codex"),
-            modified_at=_safe_mtime(path),
-        )
-        for path in files[:limit]
-    ]
-
-
-def _discover_claude_sessions(cwd: Path | None, limit: int) -> list[SessionInfo]:
-    root = Path.home() / ".claude" / "projects"
-    if not root.exists():
-        return []
-
-    def top_level_jsonl(project_dir: Path) -> list[tuple[Path, str]]:
-        try:
-            return [
-                (path, project_dir.name) for path in project_dir.glob("*.jsonl") if path.is_file()
-            ]
-        except OSError:
-            return []
-
-    preferred_name = cwd.as_posix().replace("/", "-") if cwd is not None else None
-    preferred: list[tuple[Path, str]] = []
-    other: list[tuple[Path, str]] = []
-
-    if preferred_name:
-        preferred_dir = root / preferred_name
-        if preferred_dir.exists():
-            preferred = top_level_jsonl(preferred_dir)
-            preferred.sort(key=lambda pair: _safe_mtime(pair[0]), reverse=True)
-
-    try:
-        project_dirs = list(root.iterdir())
-    except OSError:
-        project_dirs = []
-    for project_dir in project_dirs:
-        if not project_dir.is_dir():
-            continue
-        if preferred_name and project_dir.name == preferred_name:
-            continue
-        other.extend(top_level_jsonl(project_dir))
-
-    other.sort(key=lambda pair: _safe_mtime(pair[0]), reverse=True)
-    combined = (preferred + other)[:limit]
-    return [
-        SessionInfo(
-            id=path.stem,
-            path=path,
-            agent="claude",
-            project=project_name,
-            title=extract_session_title(str(path), "claude"),
-            modified_at=_safe_mtime(path),
-        )
-        for path, project_name in combined
-    ]
-
-
-def discover_sessions(agent: str, cwd: Path | None = None, limit: int = 10) -> list[SessionInfo]:
-    if agent == "codex":
-        return _discover_codex_sessions(limit)
-    return _discover_claude_sessions(cwd, limit)
-
-
 PASTE_SESSION_LABEL = "Paste session ID..."
 # Sentinel value for "user picked the paste option" — distinct from any
 # session id string so a real session titled "Paste session ID..." can't
@@ -375,10 +207,10 @@ def _prompt_paste_session_id() -> str | None:
 
 
 def choose_session(agent: str, cwd: Path | None = None) -> str | None:
-    sessions = discover_sessions(agent, cwd=cwd)
+    sessions = discover_session_candidates(agent, cwd=cwd, limit=20)
     labels = (
         ["New session"]
-        + [f"{(session.title or '[no title]')} [{session.id[:8]}]" for session in sessions]
+        + [_session_picker_label(session) for session in sessions]
         + [PASTE_SESSION_LABEL]
     )
 
@@ -389,18 +221,28 @@ def choose_session(agent: str, cwd: Path | None = None) -> str | None:
         return _prompt_paste_session_id()
     for session, label in zip(sessions, labels[1:-1]):
         if label == selected:
-            return session.id
+            return session.resume_id
     return None
 
 
-def _session_picker_items(sessions: list[SessionInfo]) -> list[tuple[str, Any]]:
+def _session_picker_items(sessions: list[SessionCandidate]) -> list[tuple[str, Any]]:
     items: list[tuple[str, Any]] = [("New session", None)]
     for session in sessions:
-        title = session.title or "[no title]"
-        label = f"{title} [{session.id[:8]}]"
-        items.append((label, session.id))
+        items.append((_session_picker_label(session), session.resume_id))
     items.append((PASTE_SESSION_LABEL, PASTE_SESSION))
     return items
+
+
+def _session_picker_label(session: SessionCandidate) -> str:
+    title = session.title or "[no title]"
+    short_id = session.resume_id[:8]
+    project = _session_project(session)
+    if session.git_branch:
+        project = f"{project}/{session.git_branch}"
+    modified = session.modified_at.isoformat() if session.modified_at is not None else None
+    age = _relative_time(modified).strip("()") if modified else "unknown age"
+    source = _session_source_text(session)
+    return f"{title} [{short_id}] · {project} · {age} · {source} · {session.confidence}"
 
 
 def read_prompt(initial: str = "") -> str:
@@ -1486,7 +1328,7 @@ def jobs_menu(dry_run: bool = False) -> int:
         return None
 
     def _nj_pick_session(form: dict) -> None:
-        sessions = discover_sessions(form["agent"], cwd=Path(form["cwd"]))
+        sessions = discover_session_candidates(form["agent"], cwd=Path(form["cwd"]), limit=20)
         items = _session_picker_items(sessions)
 
         def on_pick(value: Any) -> str | None:
@@ -1993,7 +1835,7 @@ def jobs_menu(dry_run: bool = False) -> int:
         if not job:
             state.message = "No job selected."
             return
-        sessions = discover_sessions(job["agent"], cwd=Path(job["cwd"]))
+        sessions = discover_session_candidates(job["agent"], cwd=Path(job["cwd"]), limit=20)
         items = _session_picker_items(sessions)
 
         def on_pick(value: Any) -> str | None:
@@ -2220,6 +2062,158 @@ def jobs_menu(dry_run: bool = False) -> int:
     return 0
 
 
+def _session_ok(session: SessionCandidate) -> str:
+    return "yes" if session.resumable and not session.archived and not session.subagent else "no"
+
+
+def _session_modified(session: SessionCandidate) -> str:
+    if session.modified_at is None:
+        return "-"
+    return session.modified_at.astimezone().strftime("%Y-%m-%d")
+
+
+def _session_project(session: SessionCandidate) -> str:
+    if session.cwd is not None:
+        return session.cwd.name or session.cwd.as_posix()
+    if session.git_root is not None:
+        return session.git_root.name or session.git_root.as_posix()
+    return "-"
+
+
+def _session_warning_text(session: SessionCandidate) -> str:
+    return "; ".join(session.warnings) if session.warnings else "-"
+
+
+def _session_source_text(session: SessionCandidate) -> str:
+    return session.source_kind or "-"
+
+
+def _session_title_text(session: SessionCandidate) -> str:
+    return session.title or session.session_id[:8]
+
+
+def _session_row(session: SessionCandidate) -> str:
+    columns = [
+        session.agent,
+        _session_ok(session),
+        str(session.confidence),
+        _session_modified(session),
+        session.resume_id[:8],
+        _session_title_text(session),
+        _session_project(session),
+        _session_source_text(session),
+        _session_warning_text(session),
+    ]
+    return " | ".join(columns)
+
+
+def _session_json_payload(session: SessionCandidate) -> dict[str, Any]:
+    return {
+        "agent": session.agent,
+        "session_id": session.session_id,
+        "resume_id": session.resume_id,
+        "title": session.title,
+        "cwd": str(session.cwd) if session.cwd is not None else None,
+        "git_root": str(session.git_root) if session.git_root is not None else None,
+        "git_branch": session.git_branch,
+        "source_path": str(session.source_path) if session.source_path is not None else None,
+        "source_kind": session.source_kind,
+        "created_at": session.created_at.isoformat() if session.created_at is not None else None,
+        "modified_at": session.modified_at.isoformat() if session.modified_at is not None else None,
+        "last_user_message": session.last_user_message,
+        "message_count": session.message_count,
+        "archived": session.archived,
+        "subagent": session.subagent,
+        "resumable": session.resumable,
+        "confidence": session.confidence,
+        "evidence": list(session.evidence),
+        "warnings": list(session.warnings),
+    }
+
+
+def cli_sessions(
+    agent: str | None = None,
+    *,
+    all_projects: bool = False,
+    include_non_resumable: bool = False,
+    as_json: bool = False,
+) -> int:
+    cwd = Path.cwd()
+    if agent:
+        sessions = discover_session_candidates(
+            agent,
+            cwd=cwd,
+            limit=20,
+            include_non_resumable=include_non_resumable,
+            all_projects=all_projects,
+        )
+    else:
+        sessions = discover_all_session_candidates(
+            cwd=cwd,
+            limit=20,
+            include_non_resumable=include_non_resumable,
+            all_projects=all_projects,
+        )
+    if as_json:
+        print(json.dumps([_session_json_payload(session) for session in sessions], indent=2))
+        return 0
+    if not sessions:
+        print("No sessions.")
+        return 0
+    header = "Agent | OK | Conf | Modified | Session | Title | Project | Source | Warnings"
+    print(header)
+    for session in sessions:
+        print(_session_row(session))
+    return 0
+
+
+def cli_sessions_doctor(as_json: bool = False) -> int:
+    diagnostic = diagnose_session_candidates(cwd=Path.cwd())
+    if as_json:
+        payload = {
+            "sources": [
+                {
+                    "agent": source.agent,
+                    "source_kind": source.source_kind,
+                    "root": str(source.root) if source.root is not None else None,
+                    "checked": source.checked,
+                    "available": source.available,
+                    "candidate_count": source.candidate_count,
+                    "error": source.error,
+                }
+                for source in diagnostic.sources
+            ],
+            "excluded": [_session_json_payload(session) for session in diagnostic.excluded],
+            "warnings": list(diagnostic.warnings),
+        }
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    groups = [("Claude", "claude"), ("Codex", "codex"), ("Ledger", "all")]
+    for label, agent_key in groups:
+        sources = [source for source in diagnostic.sources if source.agent == agent_key]
+        if not sources:
+            continue
+        excluded = [session for session in diagnostic.excluded if session.agent == agent_key]
+        print(f"{label}:")
+        print(f"  roots checked: {len(sources)}")
+        print(f"  candidates excluded: {len(excluded)}")
+        for source in sources:
+            root = str(source.root) if source.root is not None else "-"
+            available = "yes" if source.available else "no"
+            print(
+                f"  {source.source_kind}: available={available} "
+                f"count={source.candidate_count} root={root}"
+            )
+            if source.error:
+                print(f"    error: {source.error}")
+    if diagnostic.warnings:
+        print("Warnings:")
+        for warning in diagnostic.warnings:
+            print(f"  {warning}")
+    return 0
+
+
 # --- argparse + entrypoint ------------------------------------------------
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -2275,6 +2269,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ses_alias_p.add_argument("job_id")
     ses_alias_p.add_argument("session", nargs="?")
     ses_alias_p.add_argument("--new", action="store_true")
+
+    sessions_p = sub.add_parser("sessions", help="Inspect discovered Claude/Codex sessions.")
+    sessions_p.add_argument("subject", nargs="?", choices=["claude", "codex", "doctor"])
+    sessions_p.add_argument("--all-projects", action="store_true")
+    sessions_p.add_argument("--include-non-resumable", action="store_true")
+    sessions_p.add_argument("--json", action="store_true")
 
     retry_p = sub.add_parser("retry", help="Retry a completed/failed job at a new time.")
     retry_p.add_argument("job_id")
@@ -2422,6 +2422,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.session is None:
                 parser.error(f"{args.command} requires either a session id or --new")
             return cli_change_session(args.job_id, args.session)
+        if args.command == "sessions":
+            if args.subject == "doctor":
+                return cli_sessions_doctor(as_json=args.json)
+            return cli_sessions(
+                agent=args.subject,
+                all_projects=args.all_projects,
+                include_non_resumable=args.include_non_resumable,
+                as_json=args.json,
+            )
         if args.command == "retry":
             return cli_retry_job(args.job_id, args.when)
         if args.command == "submit":

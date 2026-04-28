@@ -134,12 +134,17 @@ Once you've created a job via the TUI, all management is via subcommands.
 schedule-agent                               # interactive TUI
 schedule-agent list                          # all jobs
 schedule-agent show <id>                     # full detail
+schedule-agent sessions                      # discover likely resumable sessions
+schedule-agent sessions claude               # Claude only
+schedule-agent sessions codex                # Codex only
+schedule-agent sessions --json               # machine-readable discovery output
+schedule-agent sessions doctor               # discovery diagnostics
 
 schedule-agent reschedule <id> "now + 90 minutes"
 schedule-agent reschedule <id> "03:00 tomorrow"
 
-schedule-agent session <id> <session_id>     # attach a session
-schedule-agent session <id> --new            # reset to a fresh session
+schedule-agent set-session <id> <session_id> # attach a session
+schedule-agent set-session <id> --new        # reset to a fresh session
 
 schedule-agent delete <id>
 
@@ -159,6 +164,23 @@ Change your mind after submitting? Fine. If a job is already queued with `at`, s
 3. resubmits under the new time / session
 
 No manual bookkeeping.
+
+### Session discovery
+
+Session picking and `schedule-agent sessions` use the same discovery pipeline:
+
+- `schedule-agent` keeps an append-only local session ledger for jobs it runs
+- Claude/Codex provider files are scanned as supporting evidence only
+- provider files are treated as **read-only** input and are never rewritten or repaired
+- current-project sessions are preferred over unrelated history
+- archived, subagent, and other non-resumable sessions stay out of the default picker
+
+When discovery looks wrong, run:
+
+```bash
+schedule-agent sessions doctor
+schedule-agent sessions doctor --json
+```
 
 ---
 
@@ -183,6 +205,7 @@ export EDITOR="code --wait"
 | Path | Contents |
 |------|----------|
 | `~/.local/state/schedule-agent/` | job queue + state + logs |
+| `~/.local/state/schedule-agent/session-ledger.jsonl` | append-only session ledger used for discovery and post-job reconciliation |
 | `~/.local/share/schedule-agent/agent_prompts/` | prompt files |
 | `~/.config/schedule-agent/prompt-prefix-{claude,codex}.md` | per-agent prefix applied to every scheduled prompt |
 

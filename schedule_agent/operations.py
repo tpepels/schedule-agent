@@ -30,6 +30,8 @@ from .scheduler_backend import (
     resolve_schedule_spec,
     submit_job,
 )
+from .sessions.discovery import reconcile_job_session, snapshot_provider_artifacts
+from .sessions.git_context import detect_git_context
 from .state_model import (
     can_change_session,
     can_delete,
@@ -418,6 +420,9 @@ def create_job(
             cwd=cwd,
             log_dir=job_log_dir(job_id),
         )
+        context = detect_git_context(Path(cwd))
+        job["git_root"] = str(context.git_root) if context.git_root is not None else None
+        job["git_branch"] = context.git_branch
         job["provenance"] = _build_provenance(probe, report)
         jobs = load_jobs()
         jobs.append(job)
@@ -534,9 +539,13 @@ def _retry_and_submit(job_id: str, resolved: str) -> dict:
 
 
 def mark_running(job_id: str, started_at: str, log_file: str) -> dict:
+    snapshot: dict[str, dict[str, int]] | None = None
     with _locked_queue():
         jobs, idx, job = _load_locked_job(job_id)
+        snapshot = snapshot_provider_artifacts(job["agent"], cwd=Path(job["cwd"]))
         updated = on_start(job, started_at=started_at, log_file=log_file)
+        updated["session_artifact_snapshot"] = snapshot
+        updated.pop("session_reconciliation", None)
         jobs[idx] = updated
         save_jobs(jobs)
         return updated
@@ -594,6 +603,7 @@ def mark_finished(
     exit_code: int,
     log_file: str | None = None,
 ) -> dict:
+    updated: dict
     with _locked_queue():
         jobs, idx, job = _load_locked_job(job_id)
         if exit_code == 0:
@@ -615,6 +625,15 @@ def mark_finished(
         jobs[idx] = updated
         jobs = _update_dependents(jobs, parent_id=job_id, parent_result=result)
         save_jobs(jobs)
+    summary = reconcile_job_session(updated, finished_at=finished_at, exit_code=exit_code)
+    with _locked_queue():
+        jobs, idx, stored = _load_locked_job(job_id)
+        refreshed = dict(stored)
+        refreshed["session_reconciliation"] = summary
+        refreshed.pop("session_artifact_snapshot", None)
+        jobs[idx] = refreshed
+        save_jobs(jobs)
+        updated = refreshed
     _fire_post_hook(updated, result)
     return updated
 

@@ -27,3 +27,6 @@ __pycache__/
 
 .coverage
 prompts/
+
+# thinindex
+.dev_index/

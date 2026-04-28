@@ -1,3 +1,7 @@
+import json
+import os
+from pathlib import Path
+
 import pytest
 
 
@@ -16,6 +20,11 @@ def _write_job(app_modules, **overrides):
     job.update(overrides)
     app_modules.persistence.save_jobs([job])
     return job
+
+
+def _write_jsonl(path: Path, *entries: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(json.dumps(entry) for entry in entries), encoding="utf-8")
 
 
 def test_list_job_views_reports_missing_and_drifted_scheduler_states(app_modules, monkeypatch):
@@ -243,6 +252,150 @@ def test_mark_finished_failure_blocks_dependents(app_modules):
     jobs = app_modules.persistence.load_jobs()
     child = next(job for job in jobs if job["id"] == "child")
     assert child["readiness"] == "blocked"
+
+
+def test_mark_finished_reconciles_fresh_session_into_ledger(app_modules, tmp_path):
+    operations = app_modules.operations
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("Fresh prompt\nbody", encoding="utf-8")
+    log_dir = tmp_path / "logs" / "job1"
+    log_dir.mkdir(parents=True)
+    job = app_modules.transitions.make_job(
+        job_id="job1",
+        title="Fresh prompt",
+        agent="codex",
+        session_mode="new",
+        session_id=None,
+        prompt_file=str(prompt),
+        scheduled_for="2026-04-18T09:00:00+0000",
+        cwd=str(cwd),
+        log_dir=str(log_dir),
+    )
+    job["git_root"] = str(cwd)
+    job["git_branch"] = "main"
+    job = app_modules.transitions.on_submit(job, "42")
+    app_modules.persistence.save_jobs([job])
+
+    operations.mark_running(
+        "job1", started_at="2026-04-18T09:00:00+0000", log_file=str(log_dir / "run.log")
+    )
+    rollout = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "04" / "18" / "fresh.jsonl"
+    _write_jsonl(
+        rollout,
+        {"type": "session_meta", "payload": {"id": "fresh-1", "source": "exec", "cwd": str(cwd)}},
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "Fresh prompt"}},
+    )
+
+    updated = operations.mark_finished(
+        "job1",
+        finished_at="2026-04-18T09:05:00+0000",
+        exit_code=0,
+        log_file=str(log_dir / "run.log"),
+    )
+
+    assert updated["session_reconciliation"]["ledger_written"] is True
+    assert updated["session_reconciliation"]["matched_session_id"] == "fresh-1"
+
+
+def test_mark_finished_avoids_false_certainty_for_ambiguous_sessions(app_modules, tmp_path):
+    operations = app_modules.operations
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("Same prompt\nbody", encoding="utf-8")
+    log_dir = tmp_path / "logs" / "job1"
+    log_dir.mkdir(parents=True)
+    job = app_modules.transitions.make_job(
+        job_id="job1",
+        title="Same prompt",
+        agent="codex",
+        session_mode="new",
+        session_id=None,
+        prompt_file=str(prompt),
+        scheduled_for="2026-04-18T09:00:00+0000",
+        cwd=str(cwd),
+        log_dir=str(log_dir),
+    )
+    job["git_root"] = str(cwd)
+    job["git_branch"] = "main"
+    job = app_modules.transitions.on_submit(job, "42")
+    app_modules.persistence.save_jobs([job])
+
+    operations.mark_running(
+        "job1", started_at="2026-04-18T09:00:00+0000", log_file=str(log_dir / "run.log")
+    )
+    base = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "04" / "18"
+    _write_jsonl(
+        base / "one.jsonl",
+        {"type": "session_meta", "payload": {"id": "cand-1", "source": "exec", "cwd": str(cwd)}},
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "Same prompt"}},
+    )
+    _write_jsonl(
+        base / "two.jsonl",
+        {"type": "session_meta", "payload": {"id": "cand-2", "source": "exec", "cwd": str(cwd)}},
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "Same prompt"}},
+    )
+
+    updated = operations.mark_finished(
+        "job1",
+        finished_at="2026-04-18T09:05:00+0000",
+        exit_code=0,
+        log_file=str(log_dir / "run.log"),
+    )
+
+    assert updated["session_reconciliation"]["ledger_written"] is False
+    assert "ambiguous" in updated["session_reconciliation"]["warning"]
+
+
+def test_mark_finished_updates_ledger_for_resumed_session_without_new_artifact(
+    app_modules, tmp_path
+):
+    operations = app_modules.operations
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("Resume prompt\nbody", encoding="utf-8")
+    log_dir = tmp_path / "logs" / "job1"
+    log_dir.mkdir(parents=True)
+    existing = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "04" / "18" / "existing.jsonl"
+    _write_jsonl(
+        existing,
+        {
+            "type": "session_meta",
+            "payload": {"id": "existing-1", "source": "exec", "cwd": str(cwd)},
+        },
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "Resume prompt"}},
+    )
+    job = app_modules.transitions.make_job(
+        job_id="job1",
+        title="Resume prompt",
+        agent="codex",
+        session_mode="resume",
+        session_id="existing-1",
+        prompt_file=str(prompt),
+        scheduled_for="2026-04-18T09:00:00+0000",
+        cwd=str(cwd),
+        log_dir=str(log_dir),
+    )
+    job["git_root"] = str(cwd)
+    job["git_branch"] = "main"
+    job = app_modules.transitions.on_submit(job, "42")
+    app_modules.persistence.save_jobs([job])
+
+    operations.mark_running(
+        "job1", started_at="2026-04-18T09:00:00+0000", log_file=str(log_dir / "run.log")
+    )
+    updated = operations.mark_finished(
+        "job1",
+        finished_at="2026-04-18T09:05:00+0000",
+        exit_code=0,
+        log_file=str(log_dir / "run.log"),
+    )
+
+    assert updated["session_reconciliation"]["ledger_written"] is True
+    assert updated["session_reconciliation"]["matched_session_id"] == "existing-1"
 
 
 def test_delete_job_removes_prompt_and_log_dir(app_modules, tmp_path, monkeypatch):
