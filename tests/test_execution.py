@@ -110,6 +110,44 @@ def test_agents_config_has_required_keys():
         assert "base_args" in cfg
 
 
+# ---------------------------------------------------------------------------
+# Stream decoding (claude only)
+# ---------------------------------------------------------------------------
+
+
+def test_claude_uses_streaming_json_output():
+    cmd = build_agent_cmd(_job("claude"))
+    assert "--output-format stream-json" in cmd
+    assert "--include-partial-messages" in cmd
+    assert "--verbose" in cmd
+
+
+def test_claude_pipes_through_stream_decoder():
+    cmd = build_agent_cmd(_job("claude"))
+    # Pipe must be after `< /dev/null` — stdin redirect needs to bind to
+    # claude, not to the decoder.
+    assert "< /dev/null" in cmd
+    decode_idx = cmd.find("stream-decode")
+    stdin_idx = cmd.find("< /dev/null")
+    assert decode_idx > stdin_idx > 0
+    assert "| " in cmd[stdin_idx:decode_idx]
+
+
+def test_claude_resume_also_pipes_through_decoder():
+    cmd = build_agent_cmd(_job("claude", session_mode="resume", session_id="sess-x"))
+    assert "stream-decode" in cmd
+    assert cmd.find("stream-decode") > cmd.find("< /dev/null")
+
+
+def test_codex_does_not_pipe_through_stream_decoder():
+    # Codex `exec` already streams plain text; piping it would just garble
+    # the log. The decoder is claude-only.
+    cmd = build_agent_cmd(_job("codex"))
+    assert "stream-decode" not in cmd
+    cmd = build_agent_cmd(_job("codex", session_mode="resume", session_id="s"))
+    assert "stream-decode" not in cmd
+
+
 def test_prompt_prefix_snapshot_is_prepended(tmp_path):
     # Prefix is now a per-job immutable snapshot written at submit time by
     # scheduler_backend; build_agent_cmd simply reads the path from

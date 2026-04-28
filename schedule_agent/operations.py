@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import environment, preflight
+from .display import display_path
 from .persistence import (
     _data_home,
     _ensure_dirs,
@@ -624,7 +625,7 @@ def format_job_summary(job: dict) -> str:
     lines = [
         f"id:            {job['id']}",
         f"title:         {job.get('title', '-')}",
-        f"status:         {job.get('display_label', display_label(job))}",
+        f"status:         {job.get('display_label') or display_label(job)}",
         f"scheduler:     {job.get('scheduler_label', '-')}",
         f"run_at:        {iso_to_display(job.get('scheduled_for'), with_seconds=True)}",
         f"created_at:    {iso_to_display(job.get('created_at'), with_seconds=True)}",
@@ -634,10 +635,10 @@ def format_job_summary(job: dict) -> str:
         f"session:       {job.get('session_mode', '-')}{session_suffix}",
         f"dependency:    {job.get('depends_on', '-')}",
         f"at_job_id:     {job.get('at_job_id') or '-'}",
-        f"log_dir:       {job.get('log_dir', '-')}",
-        f"last_log_file: {job.get('last_log_file') or '-'}",
-        f"prompt_file:   {job.get('prompt_file', '-')}",
-        f"cwd:           {job.get('cwd', '-')}",
+        f"log_dir:       {display_path(job.get('log_dir')) or '-'}",
+        f"last_log_file: {display_path(job.get('last_log_file')) or '-'}",
+        f"prompt_file:   {display_path(job.get('prompt_file')) or '-'}",
+        f"cwd:           {display_path(job.get('cwd')) or '-'}",
     ]
     if job.get("scheduler_run_at"):
         atq_run_at = iso_to_display(job.get("scheduler_run_at"), with_seconds=True)

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from . import preflight
-from .config import ensure_prompt_prefix
+from .config import ensure_prompt_prefix, load_ui_prefs, save_ui_prefs
 from .execution import AGENTS, build_agent_cmd
 from .legacy import cli_state as legacy_cli_state
 from .legacy.compat import legacy_state_file
@@ -708,14 +708,80 @@ class JobsScreenState:
 # Column widths are fixed except title, which flexes between
 # TITLE_MIN .. TITLE_MAX given the remaining budget.
 
-TITLE_MIN = 18
+TITLE_MIN = 14
 TITLE_IDEAL = 28
 TITLE_MAX = 80
-STATUS_W = 12
-RUN_AT_W = 28
-SESSION_W = 12
-UPDATED_W = 16
-CREATED_W = 16
+STATUS_W = 7
+RUN_AT_W = 10
+SESSION_W = 10
+UPDATED_W = 10
+CREATED_W = 10
+
+
+def format_compact_time(iso: str | None, now: datetime | None = None) -> str:
+    if not iso:
+        return ""
+    try:
+        target = parse_iso_datetime(iso).astimezone()
+    except Exception:
+        return ""
+    current = (now or datetime.now()).astimezone()
+    delta = (target - current).total_seconds()
+    abs_delta = abs(delta)
+
+    if abs_delta <= 30:
+        return "now"
+
+    if abs_delta < 60 * 60 * 24 * 28:
+        if delta < 0:
+            # past
+            if abs_delta < 3600:
+                rel = f"{int(abs_delta // 60)}m"
+            elif abs_delta < 86400:
+                rel = f"{int(abs_delta // 3600)}h"
+            elif abs_delta < 86400 * 7:
+                rel = f"{int(abs_delta // 86400)}d"
+            else:
+                rel = f"{int(abs_delta // (86400 * 7))}w"
+        else:
+            # future
+            if abs_delta < 3600:
+                rel = f"+{int(abs_delta // 60)}m"
+            elif abs_delta < 86400:
+                rel = f"+{int(abs_delta // 3600)}h"
+            else:
+                rel = f"+{int(abs_delta // 86400)}d"
+
+        # Same calendar day: compare the shorter of relative and clock
+        if target.date() == current.date():
+            clock = target.strftime("%H:%M")
+            if len(clock) < len(rel):
+                return clock
+            return rel
+
+        return rel
+
+    # Outside ±28 days
+    if target.year == current.year:
+        return target.strftime("%m-%d")
+    return target.strftime("%Y-%m-%d")
+
+
+_COMPACT_STATUS: dict[str | None, str] = {
+    "completed": "OK",
+    "failed": "Fail",
+    "running": "Run",
+    "queued": "Queue",
+    "scheduled": "Sched",
+    "removed": "Cncl",
+    "waiting": "Wait",
+    "blocked": "Block",
+    "invalid": "Inv",
+}
+
+
+def compact_status_label(state: str | None) -> str:
+    return _COMPACT_STATUS.get(state, "?")
 
 
 def _format_delta_short(seconds: float) -> str:
@@ -812,13 +878,17 @@ def _summary_columns(mode: str, total_width: int) -> list[tuple[str, int]]:
     # Reserve 1 column for left gutter (selection marker), and gaps (1 each).
     # Build right-hand fixed columns first, then give the rest to title.
     if mode == "narrow":
-        # title + status
-        title_width = max(TITLE_MIN, min(TITLE_MAX, total_width - STATUS_W - 2))
-        return [("title", title_width), ("status", STATUS_W)]
+        # title + status; narrow keeps the title at the minimum viable width
+        # so the limited row budget stays predictable across resizes.
+        return [("title", TITLE_MIN), ("status", STATUS_W)]
+    # Reserve 2 chars for the gutter (selection marker + space) and one
+    # space per column for the inter-column padding rendered by
+    # render_summary_row. Subtracting both lets the resulting row fit
+    # within `total_width` without truncation.
     if mode == "medium":
         # title + status + run_at + session
-        fixed = STATUS_W + RUN_AT_W + SESSION_W + 3  # 3 single-space gaps
-        title_width = max(TITLE_MIN, min(TITLE_MAX, total_width - fixed - 1))
+        fixed = STATUS_W + RUN_AT_W + SESSION_W + 4  # 4 column gaps
+        title_width = max(TITLE_MIN, min(TITLE_MAX, total_width - fixed - 2))
         return [
             ("title", title_width),
             ("status", STATUS_W),
@@ -826,8 +896,8 @@ def _summary_columns(mode: str, total_width: int) -> list[tuple[str, int]]:
             ("session", SESSION_W),
         ]
     if mode == "wide":
-        fixed = STATUS_W + RUN_AT_W + SESSION_W + UPDATED_W + 4
-        title_width = max(TITLE_MIN, min(TITLE_MAX, total_width - fixed - 1))
+        fixed = STATUS_W + RUN_AT_W + SESSION_W + UPDATED_W + 5
+        title_width = max(TITLE_MIN, min(TITLE_MAX, total_width - fixed - 2))
         return [
             ("title", title_width),
             ("status", STATUS_W),
@@ -836,8 +906,8 @@ def _summary_columns(mode: str, total_width: int) -> list[tuple[str, int]]:
             ("updated", UPDATED_W),
         ]
     # xwide
-    fixed = STATUS_W + RUN_AT_W + SESSION_W + UPDATED_W + CREATED_W + 5
-    title_width = max(TITLE_MIN, min(TITLE_MAX, total_width - fixed - 1))
+    fixed = STATUS_W + RUN_AT_W + SESSION_W + UPDATED_W + CREATED_W + 6
+    title_width = max(TITLE_MIN, min(TITLE_MAX, total_width - fixed - 2))
     return [
         ("title", title_width),
         ("status", STATUS_W),
@@ -871,20 +941,20 @@ def _column_value(job: dict, column: str) -> str:
     if column == "title":
         return job.get("title") or "(invalid)"
     if column == "status":
-        return _status_with_glyph(job)
+        state = job.get("display_state") or "invalid"
+        glyph = STATUS_GLYPHS.get(state, " ")
+        return f"{glyph} {compact_status_label(state)}"
     if column == "run_at":
-        base = iso_to_display(job.get("scheduled_for")) or "-"
-        rel = _relative_time(job.get("scheduled_for"))
-        return f"{base} {rel}".rstrip() if rel else base
+        return format_compact_time(job.get("scheduled_for")) or "-"
     if column == "session":
         sid = job.get("session_id")
         if sid:
             return sid[:SESSION_W]
         return job.get("session_mode") or "-"
     if column == "updated":
-        return iso_to_display(job.get("updated_at")) or "-"
+        return format_compact_time(job.get("updated_at")) or "-"
     if column == "created":
-        return iso_to_display(job.get("created_at")) or "-"
+        return format_compact_time(job.get("created_at")) or "-"
     return ""
 
 
@@ -892,7 +962,7 @@ def _column_header(column: str) -> str:
     return {
         "title": "Title",
         "status": "Status",
-        "run_at": "Run At",
+        "run_at": "Run",
         "session": "Session",
         "updated": "Updated",
         "created": "Created",
@@ -921,6 +991,87 @@ def render_detail(job: dict | None) -> str:
     if job is None:
         return "No job selected."
     return format_job_summary(job)
+
+
+# --- Responsive bottom toolbar -------------------------------------------
+# Each entry: (key, wide_rest, short_label, narrow_visible).
+#   wide_rest:    suffix after the highlighted key for wide tier (existing
+#                 "Add"/"C session" style — key + rest renders one word).
+#   short_label:  compact label used by normal/narrow tiers.
+#   narrow_visible: whether this action is shown on narrow / very-narrow
+#                 terminals (low-priority items drop out first).
+_TOOLBAR_ITEMS: list[tuple[str, str, str, bool]] = [
+    ("A", "dd", "Add", True),
+    ("N", "ow", "Now", True),
+    ("R", "eschedule", "Resch", True),
+    ("E", "dit", "Edit", True),
+    ("L", "og", "Log", True),
+    ("P", "refix", "Prefix", False),
+    ("C", " session", "Session", False),
+    ("U", "nschedule", "Unsched", False),
+    ("S", "ubmit", "Submit", True),
+    ("D", "elete", "Del", True),
+    ("f", "ilter", "Filter", False),
+    ("F", " scope", "Scope", False),
+    ("/", " search", "Search", True),
+    ("?", " help", "Help", True),
+    ("Q", "uit", "Quit", True),
+]
+
+
+def _toolbar_tier(width: int) -> str:
+    if width < 60:
+        return "very_narrow"
+    if width < 100:
+        return "narrow"
+    if width < 140:
+        return "normal"
+    return "wide"
+
+
+def build_toolbar_fragments(width: int) -> list[tuple[str, str]]:
+    """Return prompt_toolkit-style (style, text) fragments for the bottom
+    toolbar at the given terminal width.
+
+    Tiers:
+      wide        : full labels with key-baked-in (existing format)
+      normal      : compact labels, no key prefix (relies on help dialog)
+      narrow      : "K Label" subset, lower-priority actions hidden
+      very_narrow : keys only, single line
+    """
+    tier = _toolbar_tier(width)
+    fragments: list[tuple[str, str]] = [("class:footer", " ")]
+
+    if tier == "very_narrow":
+        for key, _, _, visible in _TOOLBAR_ITEMS:
+            if not visible:
+                continue
+            fragments.append(("class:key", key))
+            fragments.append(("class:footer", " "))
+        fragments.append(("class:footer", "\n"))
+        return fragments
+
+    if tier == "narrow":
+        for key, _, label, visible in _TOOLBAR_ITEMS:
+            if not visible:
+                continue
+            fragments.append(("class:key", key))
+            fragments.append(("class:footer", f" {label}  "))
+        fragments.append(("class:footer", "\n"))
+        return fragments
+
+    if tier == "normal":
+        for _, _, label, _ in _TOOLBAR_ITEMS:
+            fragments.append(("class:footer", f"{label}  "))
+        fragments.append(("class:footer", "\n"))
+        return fragments
+
+    # wide
+    for key, rest, _, _ in _TOOLBAR_ITEMS:
+        fragments.append(("class:key", key))
+        fragments.append(("class:footer", f"{rest}  "))
+    fragments.append(("class:footer", "\n"))
+    return fragments
 
 
 # --- Overlay input / editor ----------------------------------------------
@@ -1052,6 +1203,9 @@ def jobs_menu(dry_run: bool = False) -> int:
     from prompt_toolkit.filters import Condition
 
     state = JobsScreenState()
+    _prefs = load_ui_prefs()
+    state.filter = _prefs["filter"]
+    state.scope = _prefs["scope"]
     state.refresh_jobs()
 
     def _terminal_width() -> int:
@@ -1518,31 +1672,8 @@ def jobs_menu(dry_run: bool = False) -> int:
         if state.show_help:
             state.show_help = False
 
-    _HELP_HINT_PAIRS: list[tuple[str, str]] = [
-        ("A", "dd"),
-        ("N", "ow"),
-        ("R", "eschedule"),
-        ("E", "dit"),
-        ("L", "og"),
-        ("P", "refix"),
-        ("C", " session"),
-        ("U", "nschedule"),
-        ("S", "ubmit"),
-        ("D", "elete"),
-        ("f", "ilter"),
-        ("F", " scope"),
-        ("/", " search"),
-        ("?", " help"),
-        ("Q", "uit"),
-    ]
-
     def _help_hint_fragments() -> list[tuple[str, str]]:
-        fragments: list[tuple[str, str]] = [("class:footer", " ")]
-        for key, rest in _HELP_HINT_PAIRS:
-            fragments.append(("class:key", key))
-            fragments.append(("class:footer", f"{rest}  "))
-        fragments.append(("class:footer", "\n"))
-        return fragments
+        return build_toolbar_fragments(_terminal_width())
 
     def footer_fragments():
         fragments: list[tuple[str, str]] = _help_hint_fragments()
@@ -1788,6 +1919,10 @@ def jobs_menu(dry_run: bool = False) -> int:
         state.selected = 0
         state.refresh_jobs()
         state.message = f"Filter: {state.filter}."
+        try:
+            save_ui_prefs({"filter": state.filter, "scope": state.scope})
+        except Exception:
+            pass
 
     @kb.add("F", filter=no_overlay)
     def _cycle_scope(event):
@@ -1797,6 +1932,10 @@ def jobs_menu(dry_run: bool = False) -> int:
         state.refresh_jobs()
         label = "project (cwd)" if state.scope == "project" else "all projects"
         state.message = f"Scope: {label}."
+        try:
+            save_ui_prefs({"filter": state.filter, "scope": state.scope})
+        except Exception:
+            pass
 
     @kb.add("a", filter=no_overlay)
     def _new(event):
@@ -2174,6 +2313,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     failed_p.add_argument("--exit-code", required=True, type=int)
     failed_p.add_argument("--log-file")
 
+    sub.add_parser("stream-decode", help=argparse.SUPPRESS)
+
     doctor_p = sub.add_parser(
         "doctor",
         help="Run environment preflight checks and print a report.",
@@ -2287,6 +2428,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cli_submit_job(args.job_id, dry_run=args.dry_run)
         if args.command == "edit-prefix":
             return cli_edit_prefix(args.agent)
+        if args.command == "stream-decode":
+            from . import stream_decoder
+
+            return stream_decoder.main()
         if args.command == "doctor":
             return cli_doctor(
                 roundtrip=args.roundtrip,

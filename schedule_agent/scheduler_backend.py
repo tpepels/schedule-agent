@@ -98,6 +98,10 @@ def build_script(job: dict) -> str:
     path_export = ":".join(path_entries)
     return "\n".join(
         [
+            # pipefail: claude's output is piped through a decoder; without
+            # this the script would record decoder's exit (always 0) as
+            # the job's exit code and silently swallow agent failures.
+            "set -o pipefail",
             f"cd {shlex.quote(job['cwd'])} || exit 1",
             f"export PATH={path_export}",
             f"mkdir -p {shlex.quote(job['log_dir'])} || exit 1",

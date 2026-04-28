@@ -41,6 +41,14 @@ def test_build_script_uses_wrapper_and_stream_redirection(app_modules):
     assert "scheduled_for=2026-04-18T09:00:00+0000" in script
 
 
+def test_build_script_enables_pipefail(app_modules):
+    # Claude is piped through the stream-decoder; without pipefail the
+    # script's exit code would always be the decoder's (0) and the trap
+    # would mark a failed agent run as "done".
+    script = app_modules.scheduler_backend.build_script(_job())
+    assert "set -o pipefail" in script
+
+
 def test_submit_job_uses_at_dash_t(app_modules, monkeypatch):
     backend = app_modules.scheduler_backend
     captured = {}
