@@ -104,7 +104,7 @@ def test_choose_session_prefers_current_claude_project_and_hides_unrelated_by_de
     def fake_choose(message, choices, default=None):
         captured["message"] = message
         captured["choices"] = choices
-        return choices[1]
+        return choices[2]
 
     monkeypatch.setattr(cli, "choose", fake_choose)
 
@@ -112,8 +112,8 @@ def test_choose_session_prefers_current_claude_project_and_hides_unrelated_by_de
 
     assert captured["message"] == "Session"
     assert captured["choices"][0] == "New session"
-    assert "Preferred session" in captured["choices"][1]
-    assert captured["choices"][2] == cli.PASTE_SESSION_LABEL
+    assert captured["choices"][1] == cli.PASTE_SESSION_LABEL
+    assert "Preferred session" in captured["choices"][2]
     assert selected == "preferred"
 
 

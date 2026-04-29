@@ -208,28 +208,28 @@ def _prompt_paste_session_id() -> str | None:
 
 def choose_session(agent: str, cwd: Path | None = None) -> str | None:
     sessions = discover_session_candidates(agent, cwd=cwd, limit=20)
-    labels = (
-        ["New session"]
-        + [_session_picker_label(session) for session in sessions]
-        + [PASTE_SESSION_LABEL]
-    )
+    labels = ["New session", PASTE_SESSION_LABEL] + [
+        _session_picker_label(session) for session in sessions
+    ]
 
     selected = choose("Session", labels, default="New session")
     if selected == "New session":
         return None
     if selected == PASTE_SESSION_LABEL:
         return _prompt_paste_session_id()
-    for session, label in zip(sessions, labels[1:-1]):
+    for session, label in zip(sessions, labels[2:]):
         if label == selected:
             return session.resume_id
     return None
 
 
 def _session_picker_items(sessions: list[SessionCandidate]) -> list[tuple[str, Any]]:
-    items: list[tuple[str, Any]] = [("New session", None)]
+    items: list[tuple[str, Any]] = [
+        ("New session", None),
+        (PASTE_SESSION_LABEL, PASTE_SESSION),
+    ]
     for session in sessions:
         items.append((_session_picker_label(session), session.resume_id))
-    items.append((PASTE_SESSION_LABEL, PASTE_SESSION))
     return items
 
 
@@ -890,28 +890,24 @@ def build_toolbar_fragments(width: int) -> list[tuple[str, str]]:
                 continue
             fragments.append(("class:key", key))
             fragments.append(("class:footer", " "))
-        fragments.append(("class:footer", "\n"))
-        return fragments
-
-    if tier == "narrow":
+    elif tier == "narrow":
         for key, _, label, visible in _TOOLBAR_ITEMS:
             if not visible:
                 continue
             fragments.append(("class:key", key))
             fragments.append(("class:footer", f" {label}  "))
-        fragments.append(("class:footer", "\n"))
-        return fragments
-
-    if tier == "normal":
+    elif tier == "normal":
         for _, _, label, _ in _TOOLBAR_ITEMS:
             fragments.append(("class:footer", f"{label}  "))
-        fragments.append(("class:footer", "\n"))
-        return fragments
+    else:  # wide
+        for key, rest, _, _ in _TOOLBAR_ITEMS:
+            fragments.append(("class:key", key))
+            fragments.append(("class:footer", f"{rest}  "))
 
-    # wide
-    for key, rest, _, _ in _TOOLBAR_ITEMS:
-        fragments.append(("class:key", key))
-        fragments.append(("class:footer", f"{rest}  "))
+    used = sum(len(text) for _, text in fragments)
+    pad = width - used
+    if pad > 0:
+        fragments.append(("class:footer", " " * pad))
     fragments.append(("class:footer", "\n"))
     return fragments
 
